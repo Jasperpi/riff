@@ -1,5 +1,6 @@
 # riff
 spotify but cooler
+
 Spotify in your terminal. Plays music itself (it is its own Spotify Connect
 device), shows album art as half-blocks, ASCII or braille, follows along with
 synced lyrics, and draws a live spectrum of what you're hearing.
