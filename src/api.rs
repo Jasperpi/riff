@@ -43,6 +43,10 @@ pub struct SearchResults {
     pub albums: Vec<Album>,
     pub artists: Vec<Artist>,
     pub playlists: Vec<Playlist>,
+    /// Per kind (tracks, albums, artists, playlists): how many entries
+    /// Spotify sent, usable or not, and whether it has more after them.
+    pub seen: [usize; 4],
+    pub more: [bool; 4],
 }
 
 #[derive(Default, Debug, Clone)]
@@ -239,11 +243,16 @@ impl Api {
                 ],
             )
             .await?;
+        // Spotify sends `null` in place of results it won't show (playlists
+        // above all), so paging goes by what it sent, not by what was usable.
+        let kinds = ["tracks", "albums", "artists", "playlists"];
         Ok(SearchResults {
             tracks: arr(&v["tracks"]["items"]).iter().filter_map(track).collect(),
             albums: arr(&v["albums"]["items"]).iter().filter_map(album).collect(),
             artists: arr(&v["artists"]["items"]).iter().filter_map(artist).collect(),
             playlists: arr(&v["playlists"]["items"]).iter().filter_map(playlist).collect(),
+            seen: kinds.map(|k| arr(&v[k]["items"]).len()),
+            more: kinds.map(|k| v[k]["next"].is_string()),
         })
     }
 

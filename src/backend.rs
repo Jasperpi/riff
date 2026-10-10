@@ -29,14 +29,20 @@ pub enum Msg {
     Liked(Vec<String>),
     LikeFailed { uri: String, was: bool },
     Image { url: String, image: Option<Arc<RgbImage>> },
+    /// How near each part of a cover is, for the depth cover style.
+    Depth { url: String, map: Option<Arc<crate::art::DepthMap>> },
     Lyrics { uri: String, lyrics: Option<Lyrics> },
     Queue(Vec<Track>),
+    /// Songs that were to be queued but never made it.
+    QueueFailed(Vec<String>),
     Devices(Vec<Device>),
     TrackInfo(Track),
     Remote(RemoteState),
     Toast { text: String, error: bool },
     /// A media key or desktop widget asked for something.
     Media(crate::mpris::MediaKey),
+    /// The device we were remote-controlling is no longer there.
+    RemoteGone,
 }
 
 pub enum PageUpdate {
@@ -72,11 +78,24 @@ pub struct Backend {
     http: reqwest::Client,
     /// Tracks seen this session, so queue and now-playing lookups are free.
     memo: Arc<Mutex<HashMap<String, Track>>>,
+    /// How far into Spotify's results each search tab has read, by page and
+    /// tab. Not the same as the rows shown: some results come back empty.
+    search_at: Arc<Mutex<HashMap<(u64, usize), usize>>>,
+    /// Covers have their depth worked out one at a time.
+    #[cfg_attr(not(feature = "depth"), allow(dead_code))]
+    depth_turn: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// A list refreshed this recently is shown as-is; flipping between pages
 /// shouldn't cost a request each time.
 const FRESH: Duration = Duration::from_secs(45);
+
+/// A row standing in for a song whose details never arrived.
+fn unresolved(t: &Track) -> bool {
+    t.id.is_empty() && t.uri.starts_with("spotify:track:")
+}
+
+const SOME_MISSING: &str = "Some songs didn't load. R to try again";
 
 fn tracks_to_items(tracks: Vec<Track>) -> Vec<Item> {
     tracks.into_iter().map(Item::Track).collect()
@@ -97,7 +116,16 @@ impl Backend {
         cache: Cache,
         tx: UnboundedSender<Msg>,
     ) -> Self {
-        Self { api, engine, cache, tx, http: reqwest::Client::new(), memo: Default::default() }
+        Self {
+            api,
+            engine,
+            cache,
+            tx,
+            http: reqwest::Client::new(),
+            memo: Default::default(),
+            search_at: Default::default(),
+            depth_turn: Default::default(),
+        }
     }
 
     fn send(&self, msg: Msg) {
@@ -135,7 +163,7 @@ impl Backend {
         }
         for item in items {
             if let Item::Track(t) = item {
-                if !t.name.is_empty() {
+                if !t.name.is_empty() && !unresolved(t) {
                     memo.insert(t.uri.clone(), t.clone());
                 }
             }
@@ -167,7 +195,9 @@ impl Backend {
     pub fn load_sidebar(&self) {
         let this = self.clone();
         tokio::spawn(async move {
-            if let Some(hit) = this.cache.get::<Vec<SideEntry>>("rootlist") {
+            let cached = this.cache.get::<Vec<SideEntry>>("rootlist");
+            let have_cache = cached.is_some();
+            if let Some(hit) = cached {
                 this.send(Msg::Sidebar(hit.value));
             }
             let Ok(session) = this.engine.session().await else { return };
@@ -176,7 +206,13 @@ impl Backend {
                     this.cache.put("rootlist", "", &entries);
                     this.send(Msg::Sidebar(entries));
                 }
-                Err(e) => log::warn!("rootlist: {e}"),
+                Err(e) => {
+                    log::warn!("rootlist: {e}");
+                    // With nothing cached the sidebar would just sit empty.
+                    if !have_cache {
+                        this.toast_err(&anyhow!("Couldn't load your playlists: {e}"));
+                    }
+                }
             }
         });
     }
@@ -243,7 +279,9 @@ impl Backend {
             library.into_iter().filter(|(uri, _)| uri.starts_with("spotify:track:")).collect();
         self.send(Msg::Liked(want.iter().map(|(u, _)| u.clone()).collect()));
         let title = |n: usize| head("Liked Songs", plural(n, "song"));
-        if cached.len() == want.len() && cached.iter().zip(&want).all(|(c, w)| c.uri() == w.0) {
+        // An empty cache is no cache: a library with nothing liked still has
+        // to be told it has finished loading.
+        if have_cache && cached.len() == want.len() && cached.iter().zip(&want).all(|(c, w)| c.uri() == w.0) {
             return;
         }
 
@@ -251,18 +289,21 @@ impl Backend {
         let mut have: HashMap<String, Track> = cached
             .into_iter()
             .filter_map(|i| match i {
-                Item::Track(t) => Some((t.uri.clone(), t)),
+                Item::Track(t) if !unresolved(&t) => Some((t.uri.clone(), t)),
                 _ => None,
             })
             .collect();
         self.page(id, PageUpdate::Head(title(want.len())));
         let mut all: Vec<Item> = Vec::with_capacity(want.len());
+        let mut complete = true;
         const STEP: usize = 400;
         for (n, chunk) in want.chunks(STEP).enumerate() {
             let missing: Vec<String> =
                 chunk.iter().filter(|(u, _)| !have.contains_key(u)).map(|(u, _)| u.clone()).collect();
             if !missing.is_empty() {
-                for t in spot::tracks(&session, &missing).await {
+                let (tracks, answered) = spot::tracks_checked(&session, &missing).await;
+                complete &= answered;
+                for t in tracks {
                     have.insert(t.uri.clone(), t);
                 }
             }
@@ -290,7 +331,13 @@ impl Backend {
         if have_cache || all.is_empty() {
             self.page(id, PageUpdate::Set { tab: 0, items: all.clone(), done: true });
         }
-        self.cache.put("liked", "", &Stored { head: title(all.len()), tabs: vec![all] });
+        // Rows we never heard back about are shown, but not kept: the next
+        // visit should ask again rather than find them on disk.
+        if complete {
+            self.cache.put("liked", "", &Stored { head: title(all.len()), tabs: vec![all] });
+        } else {
+            self.send(Msg::Toast { text: SOME_MISSING.into(), error: true });
+        }
     }
 
     async fn saved_albums(&self, id: u64) {
@@ -445,9 +492,11 @@ impl Backend {
 
         let uris: Vec<String> = info.items.iter().map(|(u, _)| u.clone()).collect();
         let mut all: Vec<Item> = Vec::with_capacity(uris.len());
+        let mut complete = true;
         const STEP: usize = 400;
         for (n, chunk) in uris.chunks(STEP).enumerate() {
-            let mut tracks = spot::tracks(&session, chunk).await;
+            let (mut tracks, answered) = spot::tracks_checked(&session, chunk).await;
+            complete &= answered;
             for (i, t) in tracks.iter_mut().enumerate() {
                 t.added_at = info.items[n * STEP + i].1;
             }
@@ -467,7 +516,11 @@ impl Backend {
         if have_cache || uris.is_empty() {
             self.page(id, PageUpdate::Set { tab: 0, items: all.clone(), done: true });
         }
-        self.cache.put(&key, &info.revision, &Stored { head: page_head, tabs: vec![all] });
+        if complete {
+            self.cache.put(&key, &info.revision, &Stored { head: page_head, tabs: vec![all] });
+        } else {
+            self.send(Msg::Toast { text: SOME_MISSING.into(), error: true });
+        }
     }
 
     async fn album(&self, id: u64, aid: &str) {
@@ -491,14 +544,19 @@ impl Backend {
                 context: Some(format!("spotify:album:{aid}")),
             };
             self.page(id, PageUpdate::Head(head.clone()));
-            let items = tracks_to_items(spot::tracks(&session, &uris).await);
-            anyhow::Ok((head, items))
+            let (tracks, complete) = spot::tracks_checked(&session, &uris).await;
+            anyhow::Ok((head, tracks_to_items(tracks), complete))
         }
         .await;
         match result {
-            Ok((head, items)) => {
+            Ok((head, items, complete)) => {
                 self.remember(&items);
-                self.cache.put(&key, "", &Stored { head, tabs: vec![items.clone()] });
+                // A cached album is never fetched again, so only keep a whole one.
+                if complete {
+                    self.cache.put(&key, "", &Stored { head, tabs: vec![items.clone()] });
+                } else {
+                    self.send(Msg::Toast { text: SOME_MISSING.into(), error: true });
+                }
                 self.page(id, PageUpdate::Set { tab: 0, items, done: true });
             }
             Err(e) => self.fail(id, 1, false, e),
@@ -554,13 +612,29 @@ impl Backend {
         self.page(id, PageUpdate::Head(head(&format!("“{query}”"), "Search".into())));
         let result = async {
             if let Some(api) = &self.api {
-                let r = api.search(query, "track,album,artist,playlist", 0).await?;
-                return Ok(vec![
-                    (tracks_to_items(r.tracks), true),
-                    (r.albums.into_iter().map(Item::Album).collect(), true),
-                    (r.artists.into_iter().map(Item::Artist).collect(), true),
-                    (r.playlists.into_iter().map(Item::Playlist).collect(), true),
-                ]);
+                match api.search(query, "track,album,artist,playlist", 0).await {
+                    Ok(r) => {
+                        let mut at = self.search_at.lock().unwrap();
+                        if at.len() > 400 {
+                            at.clear();
+                        }
+                        for (tab, seen) in r.seen.iter().enumerate() {
+                            at.insert((id, tab), *seen);
+                        }
+                        return Ok(vec![
+                            (tracks_to_items(r.tracks), r.more[0]),
+                            (r.albums.into_iter().map(Item::Album).collect(), r.more[1]),
+                            (r.artists.into_iter().map(Item::Artist).collect(), r.more[2]),
+                            (r.playlists.into_iter().map(Item::Playlist).collect(), r.more[3]),
+                        ]);
+                    }
+                    // The Web API being busy shouldn't take song search down
+                    // with it: the player connection can still do that part.
+                    Err(e) => {
+                        log::warn!("web search: {e}");
+                        self.send(Msg::Toast { text: "Web API is busy. Showing songs only".into(), error: false });
+                    }
+                }
             }
             let session = self.engine.session().await?;
             let uris = spot::search_tracks(&session, query).await?;
@@ -584,19 +658,23 @@ impl Backend {
                     }
                 }
             }
-            anyhow::Ok(vec![
+            let mut tabs = vec![
                 (tracks_to_items(tracks), false),
                 (albums.into_iter().map(Item::Album).collect(), false),
                 (artists.into_iter().map(Item::Artist).collect(), false),
-            ])
+            ];
+            if self.api.is_some() {
+                // The page has a playlists tab waiting; this route can't fill it.
+                tabs.push((Vec::new(), false));
+            }
+            anyhow::Ok(tabs)
         }
         .await;
         match result {
             Ok(tabs) => {
-                for (tab, (items, pageable)) in tabs.into_iter().enumerate() {
+                for (tab, (items, more)) in tabs.into_iter().enumerate() {
                     self.remember(&items);
-                    let done = !pageable || items.len() < 10;
-                    self.page(id, PageUpdate::Set { tab, items, done });
+                    self.page(id, PageUpdate::Set { tab, items, done: !more });
                 }
             }
             Err(e) => self.fail(id, 4, false, e),
@@ -610,9 +688,15 @@ impl Backend {
             let Some(api) = this.api.clone() else {
                 return this.page(id, PageUpdate::Append { tab, items: vec![], done: true });
             };
-            let kind = ["track", "album", "artist", "playlist"][tab.min(3)];
+            let tab = tab.min(3);
+            let kind = ["track", "album", "artist", "playlist"][tab];
+            // Where Spotify's own list has got to, which runs ahead of the
+            // rows shown whenever it sends back empty entries.
+            let offset = this.search_at.lock().unwrap().get(&(id, tab)).copied().unwrap_or(offset);
             match api.search(&query, kind, offset).await {
                 Ok(r) => {
+                    let next = offset + r.seen[tab];
+                    this.search_at.lock().unwrap().insert((id, tab), next);
                     let items: Vec<Item> = match tab {
                         0 => tracks_to_items(r.tracks),
                         1 => r.albums.into_iter().map(Item::Album).collect(),
@@ -620,7 +704,7 @@ impl Backend {
                         _ => r.playlists.into_iter().map(Item::Playlist).collect(),
                     };
                     this.remember(&items);
-                    let done = items.len() < 10 || offset + items.len() >= 200;
+                    let done = !r.more[tab] || r.seen[tab] == 0 || next >= 200;
                     this.page(id, PageUpdate::Append { tab, items, done });
                 }
                 Err(e) => {
@@ -636,30 +720,89 @@ impl Backend {
     pub fn load_image(&self, url: String) {
         let this = self.clone();
         tokio::spawn(async move {
-            let bytes = match this.cache.image(&url) {
-                Some(b) => Some(b),
+            let (bytes, fresh) = match this.cache.image(&url) {
+                Some(b) => (Some(b), false),
                 None => match api::fetch_bytes(&this.http, &url).await {
-                    Ok(b) => {
-                        this.cache.put_image(&url, &b);
-                        Some(b)
-                    }
+                    Ok(b) => (Some(b), true),
                     Err(e) => {
                         log::warn!("image {url}: {e}");
-                        None
+                        (None, false)
                     }
                 },
             };
             let image = match bytes {
-                Some(b) => tokio::task::spawn_blocking(move || {
-                    image::load_from_memory(&b).ok().map(|i| Arc::new(i.to_rgb8()))
-                })
-                .await
-                .ok()
-                .flatten(),
+                Some(b) => {
+                    let decoded = tokio::task::spawn_blocking(move || {
+                        let image = image::load_from_memory(&b).ok().map(|i| Arc::new(i.to_rgb8()));
+                        (image, b)
+                    })
+                    .await
+                    .ok();
+                    match decoded {
+                        // Only a picture that opens is worth keeping on disk.
+                        Some((Some(image), b)) => {
+                            if fresh {
+                                this.cache.put_image(&url, &b);
+                            }
+                            Some(image)
+                        }
+                        _ => {
+                            log::warn!("image {url}: not a picture we can read");
+                            this.cache.forget_image(&url);
+                            None
+                        }
+                    }
+                }
                 None => None,
             };
             this.send(Msg::Image { url, image });
         });
+    }
+
+    /// Work out how near each part of a cover is. Done once per cover and
+    /// kept on disk; the model itself is fetched the first time it is needed.
+    #[cfg(feature = "depth")]
+    pub fn load_depth(&self, url: String, image: Arc<RgbImage>) {
+        use crate::art::DepthMap;
+        let this = self.clone();
+        tokio::spawn(async move {
+            let map = match this.cache.depth(&url).and_then(DepthMap::from_bytes) {
+                Some(map) => Some(map),
+                None => {
+                    let made = async {
+                        // One at a time: it takes a fair bit of memory while
+                        // it runs, and the first cover waits on the download.
+                        let _turn = this.depth_turn.lock().await;
+                        if !crate::depth::model_path().exists() {
+                            let text = "Fetching the depth model (27 MB), just this once…".to_string();
+                            this.send(Msg::Toast { text, error: false });
+                            crate::depth::fetch(&this.http).await?;
+                            this.send(Msg::Toast { text: "Depth model ready".into(), error: false });
+                        }
+                        tokio::task::spawn_blocking(move || crate::depth::estimate(&image)).await?
+                    }
+                    .await;
+                    match made {
+                        Ok(map) => {
+                            this.cache.put_depth(&url, &map.near);
+                            Some(map)
+                        }
+                        Err(e) => {
+                            log::warn!("depth for {url}: {e}");
+                            this.toast_err(&anyhow!("Couldn't give the cover depth: {e}"));
+                            None
+                        }
+                    }
+                }
+            };
+            this.send(Msg::Depth { url, map: map.map(Arc::new) });
+        });
+    }
+
+    /// Built without the depth model: there is nothing to work it out with.
+    #[cfg(not(feature = "depth"))]
+    pub fn load_depth(&self, url: String, _image: Arc<RgbImage>) {
+        self.send(Msg::Depth { url, map: None });
     }
 
     pub fn load_lyrics(&self, track: Track) {
@@ -747,16 +890,20 @@ impl Backend {
     pub fn set_liked(&self, uri: String, liked: bool) {
         let this = self.clone();
         tokio::spawn(async move {
-            let result = async {
-                match &this.api {
-                    Some(api) => api.set_saved(&uri, liked).await,
-                    None => {
-                        let session = this.engine.session().await?;
-                        spot::collection_write(&session, "collection", &uri, liked).await
-                    }
-                }
+            // The player connection first: it isn't rate limited the way the
+            // Web API is. The Web API is the fallback when there is one.
+            let direct = async {
+                let session = this.engine.session().await?;
+                spot::collection_write(&session, "collection", &uri, liked).await
             }
             .await;
+            let result = match (direct, &this.api) {
+                (Err(e), Some(api)) => {
+                    log::warn!("like over the player connection: {e}");
+                    api.set_saved(&uri, liked).await
+                }
+                (direct, _) => direct,
+            };
             match result {
                 Ok(()) => {
                     // Keep the on-disk library in step so the heart survives a restart.
@@ -781,23 +928,6 @@ impl Backend {
         });
     }
 
-    pub fn queue_add(&self, uri: String, name: String) {
-        let this = self.clone();
-        tokio::spawn(async move {
-            let result = async {
-                match &this.api {
-                    Some(api) => api.queue_add(&uri).await,
-                    None => spot::queue_add(&this.engine.session().await?, &uri).await,
-                }
-            }
-            .await;
-            match result {
-                Ok(()) => this.send(Msg::Toast { text: format!("Queued {name}"), error: false }),
-                Err(e) => this.toast_err(&e),
-            }
-        });
-    }
-
     pub fn remote(&self, cmd: RemoteCmd) {
         let this = self.clone();
         tokio::spawn(async move {
@@ -806,7 +936,55 @@ impl Backend {
                 Err(e) => Err(e),
             };
             if let Err(e) = result {
-                this.toast_err(&e);
+                if e.to_string().contains("No active Spotify device") {
+                    this.send(Msg::RemoteGone);
+                } else {
+                    this.toast_err(&e);
+                }
+            }
+        });
+    }
+
+    /// Add several tracks to the queue, in order.
+    pub fn queue_many(&self, tracks: Vec<Track>) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut added = 0;
+            for t in &tracks {
+                // Each one makes the player report its state to Spotify, so a
+                // long run is spaced out rather than sent in a burst.
+                if added > 0 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                let direct = async { spot::queue_add(&this.engine.session().await?, &t.uri).await };
+                let result = match &this.api {
+                    Some(api) => match api.queue_add(&t.uri).await {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            log::warn!("queue over the Web API: {e}");
+                            direct.await
+                        }
+                    },
+                    None => direct.await,
+                };
+                match result {
+                    Ok(()) => added += 1,
+                    Err(e) => {
+                        this.toast_err(&e);
+                        break;
+                    }
+                }
+            }
+            if added < tracks.len() {
+                this.send(Msg::QueueFailed(tracks[added..].iter().map(|t| t.uri.clone()).collect()));
+            }
+            if added > 0 {
+                let text = if added == 1 {
+                    format!("Queued {}", tracks[0].name)
+                } else {
+                    format!("Queued {added} songs")
+                };
+                this.send(Msg::Toast { text, error: false });
             }
         });
     }

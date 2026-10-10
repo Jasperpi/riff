@@ -44,6 +44,7 @@ impl Cache {
     pub fn new(dir: PathBuf) -> Self {
         std::fs::create_dir_all(dir.join("data")).ok();
         std::fs::create_dir_all(dir.join("img")).ok();
+        std::fs::create_dir_all(dir.join("depth")).ok();
         Self { dir }
     }
 
@@ -82,6 +83,32 @@ impl Cache {
     }
 
     pub fn put_image(&self, url: &str, bytes: &[u8]) {
-        std::fs::write(self.image_path(url), bytes).ok();
+        // Written aside and moved into place, so a crash can't leave half a file.
+        let path = self.image_path(url);
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, bytes).is_ok() {
+            std::fs::rename(tmp, path).ok();
+        }
+    }
+
+    /// The depth map worked out for a cover, kept under the cover's own name.
+    #[cfg_attr(not(feature = "depth"), allow(dead_code))]
+    pub fn depth(&self, url: &str) -> Option<Vec<u8>> {
+        let name = self.image_path(url).file_name()?.to_owned();
+        std::fs::read(self.dir.join("depth").join(name)).ok()
+    }
+
+    #[cfg_attr(not(feature = "depth"), allow(dead_code))]
+    pub fn put_depth(&self, url: &str, map: &[u8]) {
+        let Some(name) = self.image_path(url).file_name().map(|n| n.to_owned()) else { return };
+        let path = self.dir.join("depth").join(name);
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, map).is_ok() {
+            std::fs::rename(tmp, path).ok();
+        }
+    }
+
+    pub fn forget_image(&self, url: &str) {
+        std::fs::remove_file(self.image_path(url)).ok();
     }
 }

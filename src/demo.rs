@@ -10,7 +10,7 @@ use crate::backend::{Msg, PageUpdate};
 use crate::config::Config;
 use crate::engine::{Conn, Event};
 use crate::model::*;
-use crate::viz::Tap;
+use crate::audio::Hub;
 
 const COVER: &str = "demo://cover";
 
@@ -113,7 +113,7 @@ const LYRICS: &[&str] = &[
 ];
 
 pub fn app(cfg: Config) -> App {
-    let mut app = App::new(cfg, None, Arc::new(Tap::default()));
+    let mut app = App::new(cfg, None, Arc::new(Hub::default()));
     app.demo = true;
     app.on_msg(Msg::Image { url: COVER.into(), image: Some(Arc::new(cover())) });
 

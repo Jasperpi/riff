@@ -20,17 +20,17 @@ use librespot_core::dealer::protocol::Message;
 use librespot_core::error::ErrorKind;
 use librespot_core::{Session, SessionConfig};
 use librespot_metadata::audio::UniqueFields;
-use librespot_playback::audio_backend::{self, Sink};
-use librespot_playback::config::{AudioFormat, Bitrate, PlayerConfig};
+use librespot_playback::audio_backend::Sink;
+use librespot_playback::config::{Bitrate, PlayerConfig};
 use librespot_playback::mixer::softmixer::SoftMixer;
-use librespot_playback::mixer::{Mixer, MixerConfig};
+use librespot_playback::mixer::{Mixer, MixerConfig, NoOpVolume};
 use librespot_playback::player::{Player, PlayerEvent};
 use librespot_protocol::connect::ClusterUpdate;
 use tokio::sync::{mpsc::UnboundedSender, watch};
 
 use crate::config::{self, Config};
 use crate::model::*;
-use crate::viz::{NullSink, Tap, VizSink};
+use crate::audio::{Hub, MixSink, WARNED_NO_DEVICE};
 
 /// Connection lifecycle, shown in the status line.
 #[derive(Clone, Debug, PartialEq)]
@@ -81,13 +81,17 @@ pub enum Event {
 pub struct Live {
     pub session: Session,
     spirc: Arc<Spirc>,
+    mixer: Arc<SoftMixer>,
 }
 
 pub struct Engine {
     cfg: Config,
     tx: UnboundedSender<Event>,
     live: watch::Sender<Option<Live>>,
-    tap: Arc<Tap>,
+    hub: Arc<Hub>,
+    /// The volume control, kept across reconnects so the level in force
+    /// survives them and the decks go on obeying the same one.
+    mixer: std::sync::Mutex<Option<Arc<SoftMixer>>>,
     quit: AtomicBool,
 }
 
@@ -95,15 +99,29 @@ pub fn session_dir() -> PathBuf {
     config::cache_dir().join("session")
 }
 
+/// The stored login can start a session as this account: for this user's eyes only.
+fn keep_private(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(dir.join("credentials.json"), std::fs::Permissions::from_mode(0o600));
+    }
+}
+
 pub fn librespot_cache(cfg: &Config) -> Result<Cache> {
     let dir = session_dir();
     let audio = cfg.audio_cache.then(|| config::cache_dir().join("audio"));
-    Cache::new(Some(dir.clone()), Some(dir), audio, Some(2 * 1024 * 1024 * 1024))
-        .map_err(|e| anyhow!("can't open cache: {e}"))
+    let cache = Cache::new(Some(dir.clone()), Some(dir.clone()), audio, Some(2 * 1024 * 1024 * 1024))
+        .map_err(|e| anyhow!("can't open cache: {e}"))?;
+    keep_private(&dir);
+    Ok(cache)
 }
 
 pub fn session_config(cfg: &Config) -> SessionConfig {
-    SessionConfig { device_id: cfg.device_id.clone(), ..Default::default() }
+    // Autoplay is off: riff plays explicit lists, and asking Spotify for an
+    // autoplay continuation of one always fails with a 400.
+    SessionConfig { device_id: cfg.device_id.clone(), autoplay: Some(false), ..Default::default() }
 }
 
 pub fn pct_to_vol(pct: u8) -> u16 {
@@ -119,10 +137,12 @@ impl Engine {
         cfg: Config,
         credentials: Credentials,
         tx: UnboundedSender<Event>,
-        tap: Arc<Tap>,
+        hub: Arc<Hub>,
     ) -> Arc<Self> {
         let (live, _) = watch::channel(None);
-        let engine = Arc::new(Self { cfg, tx, live, tap, quit: AtomicBool::new(false) });
+        hub.set_mix(if cfg.mix { cfg.mix_seconds as u32 } else { 0 });
+        let engine =
+            Arc::new(Self { cfg, tx, live, hub, mixer: Default::default(), quit: AtomicBool::new(false) });
         tokio::spawn(engine.clone().supervise(credentials));
         engine
     }
@@ -142,6 +162,8 @@ impl Engine {
                     if let Some(c) = live.session.cache().and_then(|c| c.credentials()) {
                         credentials = c;
                     }
+                    // The session has just written its login to disk.
+                    keep_private(&session_dir());
                     self.emit(Event::User(live.session.username()));
                     self.emit(Event::Conn(Conn::Online));
                     self.live.send_replace(Some(live));
@@ -181,7 +203,18 @@ impl Engine {
             .dealer()
             .listen_for("hm://connect-state/v1/cluster", Message::from_raw::<ClusterUpdate>)?;
 
-        let mixer = Arc::new(SoftMixer::open(MixerConfig::default())?);
+        let mixer = {
+            let mut kept = self.mixer.lock().unwrap();
+            match kept.as_ref() {
+                Some(mixer) => mixer.clone(),
+                None => {
+                    let mixer = Arc::new(SoftMixer::open(MixerConfig::default())?);
+                    mixer.set_volume(pct_to_vol(self.cfg.volume));
+                    *kept = Some(mixer.clone());
+                    mixer
+                }
+            }
+        };
         let player_config = PlayerConfig {
             bitrate: match self.cfg.bitrate {
                 96 => Bitrate::Bitrate96,
@@ -192,44 +225,45 @@ impl Engine {
             ..Default::default()
         };
 
-        let tap = self.tap.clone();
+        // Volume is applied by our own output stage (after its queue, so changes
+        // are instant), which is why the player itself gets a pass-through.
+        let hub = self.hub.clone();
         let notice = self.tx.clone();
+        let volume = mixer.get_soft_volume();
         let player = Player::new(
             player_config,
             session.clone(),
-            mixer.get_soft_volume(),
+            Box::new(NoOpVolume),
             move || -> Box<dyn Sink> {
-                // The audio backend panics when no output device exists. Catch that
-                // so the app keeps working (silently) instead of losing its player.
-                let opened = std::panic::catch_unwind(|| {
-                    let backend = audio_backend::find(None)?;
-                    Some(backend(None, AudioFormat::default()))
-                });
-                match opened {
-                    Ok(Some(sink)) => Box::new(VizSink::new(sink, tap)),
-                    _ => {
+                Box::new(MixSink::new(hub, volume, move || {
+                    if !WARNED_NO_DEVICE.swap(true, Ordering::Relaxed) {
                         let _ = notice.send(Event::Notice(
                             "No audio output device found; playing silently".into(),
                         ));
-                        Box::new(NullSink)
                     }
-                }
+                }))
             },
         );
+        self.hub.attach(player.get_player_event_channel());
         let mut events = player.get_player_event_channel();
 
         let connect_config = ConnectConfig {
             name: self.cfg.device_name.clone(),
             device_type: DeviceType::Computer,
-            initial_volume: pct_to_vol(self.cfg.volume),
+            // Whatever the level is now, not what it was when riff started.
+            initial_volume: mixer.volume(),
             ..Default::default()
         };
         let (spirc, task) =
-            Spirc::new(connect_config, session.clone(), credentials, player, mixer).await?;
+            Spirc::new(connect_config, session.clone(), credentials, player, mixer.clone()).await?;
 
         let tx = self.tx.clone();
+        let hub = self.hub.clone();
         let forward_player = tokio::spawn(async move {
             while let Some(ev) = events.recv().await {
+                if let PlayerEvent::Seeked { position_ms, .. } = &ev {
+                    hub.seeked(*position_ms);
+                }
                 if let Some(ev) = translate(ev) {
                     if tx.send(ev).is_err() {
                         break;
@@ -253,7 +287,7 @@ impl Engine {
             }
         });
 
-        let live = Live { session, spirc: Arc::new(spirc) };
+        let live = Live { session, spirc: Arc::new(spirc), mixer };
         let done = async move {
             task.await;
             forward_player.abort();
@@ -264,10 +298,6 @@ impl Engine {
 
     fn emit(&self, ev: Event) {
         let _ = self.tx.send(ev);
-    }
-
-    pub fn is_online(&self) -> bool {
-        self.live.borrow().is_some()
     }
 
     /// The live session, waiting briefly if a (re)connect is in flight.
@@ -312,8 +342,42 @@ impl Engine {
         self.with(|s| s.set_position_ms(ms))
     }
 
+    /// Tell Spotify (and other devices) the volume. Each call costs a network
+    /// request, so the app sends it once a volume change has settled.
     pub fn volume(&self, pct: u8) -> Result<()> {
         self.with(|s| s.set_volume(pct_to_vol(pct)))
+    }
+
+    /// The pieces a second audio path (the DJ decks) needs: the session to
+    /// fetch songs with, and the master volume to obey.
+    pub fn deck_parts(&self) -> Option<(Session, Box<dyn librespot_playback::mixer::VolumeGetter + Send>)> {
+        let live = self.live.borrow();
+        let live = live.as_ref()?;
+        Some((live.session.clone(), live.mixer.get_soft_volume()))
+    }
+
+    pub fn bitrate(&self) -> Bitrate {
+        match self.cfg.bitrate {
+            96 => Bitrate::Bitrate96,
+            160 => Bitrate::Bitrate160,
+            _ => Bitrate::Bitrate320,
+        }
+    }
+
+    pub fn normalize(&self) -> bool {
+        self.cfg.normalize
+    }
+
+    /// Change what is heard right now. Purely local: no request is made.
+    pub fn volume_local(&self, pct: u8) {
+        if let Some(live) = self.live.borrow().as_ref() {
+            live.mixer.set_volume(pct_to_vol(pct));
+        }
+    }
+
+    /// Crossfade length in seconds; 0 turns mixing off. Takes effect at once.
+    pub fn set_mix(&self, seconds: u32) {
+        self.hub.set_mix(seconds);
     }
 
     pub fn shuffle(&self, on: bool) -> Result<()> {
@@ -327,10 +391,16 @@ impl Engine {
         })
     }
 
-    fn options(&self, shuffle: bool, repeat: &Repeat, at: Option<PlayingTrack>) -> LoadRequestOptions {
+    fn options(
+        &self,
+        shuffle: bool,
+        repeat: &Repeat,
+        at: Option<PlayingTrack>,
+        seek_to: u32,
+    ) -> LoadRequestOptions {
         LoadRequestOptions {
             start_playing: true,
-            seek_to: 0,
+            seek_to,
             context_options: Some(LoadContextOptions::Options(Options {
                 shuffle,
                 repeat: *repeat == Repeat::Context,
@@ -340,16 +410,17 @@ impl Engine {
         }
     }
 
-    /// Play a list of tracks, starting at `index`.
+    /// Play a list of tracks, starting at `index`, `start_ms` into that track.
     pub fn play_tracks(
         &self,
         uris: Vec<String>,
         index: usize,
+        start_ms: u32,
         shuffle: bool,
         repeat: &Repeat,
     ) -> Result<()> {
         let at = Some(PlayingTrack::Index(index as u32));
-        let request = LoadRequest::from_tracks(uris, self.options(shuffle, repeat, at));
+        let request = LoadRequest::from_tracks(uris, self.options(shuffle, repeat, at, start_ms));
         self.with(|s| {
             // `load` is ignored unless this device is the active one.
             s.activate()?;

@@ -253,6 +253,21 @@ impl TokenStore {
     }
 
     async fn refresh(&self, old: &Tokens) -> Result<Tokens> {
+        match self.refresh_with(old).await {
+            Ok(tokens) => Ok(tokens),
+            // Spotify retires a refresh token when it hands out the next one.
+            // If another riff (`riff doctor`, say) renewed the login since
+            // this one read it, the one that works is on disk.
+            Err(e) => match Tokens::load() {
+                Some(disk) if disk.client_id == old.client_id && disk.refresh_token != old.refresh_token => {
+                    self.refresh_with(&disk).await
+                }
+                _ => Err(e),
+            },
+        }
+    }
+
+    async fn refresh_with(&self, old: &Tokens) -> Result<Tokens> {
         let refresh = old
             .refresh_token
             .as_deref()
@@ -269,6 +284,9 @@ impl TokenStore {
             .send()
             .await
             .context("could not reach accounts.spotify.com")?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            bail!("Spotify is rate limiting sign-ins; try again in a minute");
+        }
         if resp.status().is_client_error() {
             bail!("login expired; run `riff login`");
         }

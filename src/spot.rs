@@ -3,8 +3,11 @@
 //! aren't subject to its rate limits and work for playlists you merely follow.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use librespot_core::error::ErrorKind;
 use librespot_core::{Session, SpotifyId, SpotifyUri};
 use librespot_protocol::extended_metadata::{BatchedEntityRequest, EntityRequest, ExtensionQuery};
 use librespot_protocol::extension_kind::ExtensionKind;
@@ -17,6 +20,19 @@ use crate::model::*;
 
 fn err(e: librespot_core::Error) -> anyhow::Error {
     anyhow!("Spotify: {e}")
+}
+
+/// The player connection has no timeout of its own, so a stalled one would
+/// leave a page loading for ever. Give up on a request after this long.
+const PATIENCE: Duration = Duration::from_secs(20);
+
+async fn within<T>(
+    request: impl Future<Output = Result<T, librespot_core::Error>>,
+) -> Result<T, librespot_core::Error> {
+    match tokio::time::timeout(PATIENCE, request).await {
+        Ok(answer) => answer,
+        Err(_) => Err(librespot_core::Error::deadline_exceeded("no answer from Spotify")),
+    }
 }
 
 fn b62(gid: &[u8]) -> Option<String> {
@@ -77,26 +93,31 @@ fn album_from(a: &pb::Album) -> Option<Album> {
 }
 
 /// Fetch one kind of metadata for many URIs: a few requests of 100 in flight
-/// at a time, so even thousands of tracks arrive in a second or two.
-async fn batch(session: &Session, kind: ExtensionKind, uris: &[String]) -> Vec<(String, Vec<u8>)> {
+/// at a time, so even thousands of tracks arrive in a second or two. The flag
+/// says whether every request was answered; when it is false, entries missing
+/// from the result may simply not have been heard back about.
+async fn batch(session: &Session, kind: ExtensionKind, uris: &[String]) -> (Vec<(String, Vec<u8>)>, bool) {
     let chunks: Vec<&[String]> = uris.chunks(100).collect();
     let mut out = Vec::with_capacity(uris.len());
+    let mut complete = true;
     for wave in chunks.chunks(4) {
         let mut requests = Vec::with_capacity(wave.len());
         for chunk in wave {
             requests.push(batch_chunk(session, kind, chunk));
         }
-        for part in futures::future::join_all(requests).await {
+        for (part, answered) in futures::future::join_all(requests).await {
             out.extend(part);
+            complete &= answered;
         }
     }
-    out
+    (out, complete)
 }
 
 /// One request's worth. If the service rejects it, the chunk is split and
 /// retried so a single bad entry can't sink the rest.
-async fn batch_chunk(session: &Session, kind: ExtensionKind, uris: &[String]) -> Vec<(String, Vec<u8>)> {
+async fn batch_chunk(session: &Session, kind: ExtensionKind, uris: &[String]) -> (Vec<(String, Vec<u8>)>, bool) {
     let mut out = Vec::with_capacity(uris.len());
+    let mut answered = true;
     let mut work: Vec<&[String]> = vec![uris];
     while let Some(chunk) = work.pop() {
         let request = BatchedEntityRequest {
@@ -113,7 +134,7 @@ async fn batch_chunk(session: &Session, kind: ExtensionKind, uris: &[String]) ->
                 .collect(),
             ..Default::default()
         };
-        match session.spclient().get_extended_metadata(request).await {
+        match within(session.spclient().get_extended_metadata(request)).await {
             Ok(response) => {
                 for array in response.extended_metadata {
                     for entry in array.extension_data {
@@ -123,25 +144,42 @@ async fn batch_chunk(session: &Session, kind: ExtensionKind, uris: &[String]) ->
                     }
                 }
             }
-            Err(e) if chunk.len() > 1 => {
-                log::warn!("metadata batch of {} failed ({e}); splitting", chunk.len());
-                let (a, b) = chunk.split_at(chunk.len() / 2);
-                work.push(a);
-                work.push(b);
+            // Only a rejected request points at a bad entry. A rate limit or
+            // a dead connection would fail both halves as well, and splitting
+            // turns one failed request into two hundred.
+            Err(e) if matches!(e.kind, ErrorKind::InvalidArgument | ErrorKind::NotFound) => {
+                if chunk.len() > 1 {
+                    log::warn!("metadata batch of {} rejected ({e}); splitting", chunk.len());
+                    let (a, b) = chunk.split_at(chunk.len() / 2);
+                    work.push(a);
+                    work.push(b);
+                } else {
+                    log::warn!("no metadata for {}: {e}", chunk[0]);
+                }
             }
-            Err(e) => log::warn!("no metadata for {}: {e}", chunk[0]),
+            Err(e) => {
+                log::warn!("metadata batch of {} failed: {e}", chunk.len());
+                answered = false;
+            }
         }
     }
-    out
+    (out, answered)
 }
 
 /// Full details for track URIs, returned in the order asked. Episodes and local
 /// files are given placeholder rows so list positions stay intact.
 pub async fn tracks(session: &Session, uris: &[String]) -> Vec<Track> {
+    tracks_checked(session, uris).await.0
+}
+
+/// As `tracks`, and whether every lookup was answered. When it wasn't, some of
+/// the "Unavailable" rows are songs we never heard back about, so the result
+/// is fine to show but not to keep.
+pub async fn tracks_checked(session: &Session, uris: &[String]) -> (Vec<Track>, bool) {
     let wanted: Vec<String> =
         uris.iter().filter(|u| u.starts_with("spotify:track:")).cloned().collect();
-    let found: HashMap<String, Track> = batch(session, ExtensionKind::TRACK_V4, &wanted)
-        .await
+    let (found, complete) = batch(session, ExtensionKind::TRACK_V4, &wanted).await;
+    let found: HashMap<String, Track> = found
         .into_iter()
         .filter_map(|(uri, bytes)| {
             let t = pb::Track::parse_from_bytes(&bytes).ok()?;
@@ -149,11 +187,8 @@ pub async fn tracks(session: &Session, uris: &[String]) -> Vec<Track> {
         })
         .collect();
 
-    uris.iter()
-        .map(|uri| {
-            found.get(uri).cloned().unwrap_or_else(|| placeholder(uri))
-        })
-        .collect()
+    let tracks = uris.iter().map(|uri| found.get(uri).cloned().unwrap_or_else(|| placeholder(uri))).collect();
+    (tracks, complete)
 }
 
 fn placeholder(uri: &str) -> Track {
@@ -180,6 +215,7 @@ pub async fn albums(session: &Session, ids: &[String]) -> Vec<Album> {
     let uris: Vec<String> = ids.iter().map(|id| format!("spotify:album:{id}")).collect();
     let found: HashMap<String, Album> = batch(session, ExtensionKind::ALBUM_V4, &uris)
         .await
+        .0
         .into_iter()
         .filter_map(|(uri, bytes)| {
             Some((uri, album_from(&pb::Album::parse_from_bytes(&bytes).ok()?)?))
@@ -193,6 +229,7 @@ pub async fn artists(session: &Session, ids: &[String]) -> Vec<Artist> {
     let uris: Vec<String> = ids.iter().map(|id| format!("spotify:artist:{id}")).collect();
     let found: HashMap<String, Artist> = batch(session, ExtensionKind::ARTIST_V4, &uris)
         .await
+        .0
         .into_iter()
         .filter_map(|(uri, bytes)| {
             let a = pb::Artist::parse_from_bytes(&bytes).ok()?;
@@ -215,7 +252,7 @@ pub async fn rootlist(session: &Session) -> Result<Vec<SideEntry>> {
     let mut from = 0usize;
     const PAGE: usize = 500;
     for _ in 0..20 {
-        let bytes = session.spclient().get_rootlist(from, Some(PAGE)).await.map_err(err)?;
+        let bytes = within(session.spclient().get_rootlist(from, Some(PAGE))).await.map_err(err)?;
         let list = SelectedListContent::parse_from_bytes(&bytes)?;
         let contents = list.contents.get_or_default();
         for (i, item) in contents.items.iter().enumerate() {
@@ -299,7 +336,7 @@ pub struct PlaylistHead {
 /// an unchanged playlist (same revision) costs a single request.
 pub async fn playlist(session: &Session, id: &str) -> Result<PlaylistHead> {
     let sid = SpotifyId::from_base62(id).map_err(|_| anyhow!("bad playlist id"))?;
-    let bytes = session.spclient().get_playlist(&sid).await.map_err(err)?;
+    let bytes = within(session.spclient().get_playlist(&sid)).await.map_err(err)?;
     let list = SelectedListContent::parse_from_bytes(&bytes)?;
     let attrs = list.attributes.get_or_default();
     let mut items: Vec<(String, Option<i64>)> = Vec::new();
@@ -318,9 +355,7 @@ pub async fn playlist(session: &Session, id: &str) -> Result<PlaylistHead> {
         guard += 1;
         let endpoint =
             format!("/playlist/v2/playlist/{id}?from={}&length=1000", items.len());
-        let more = session
-            .spclient()
-            .request(&Method::GET, &endpoint, None, None)
+        let more = within(session.spclient().request(&Method::GET, &endpoint, None, None))
             .await
             .map_err(err)?;
         let more = SelectedListContent::parse_from_bytes(&more)?;
@@ -354,9 +389,7 @@ pub async fn playlist(session: &Session, id: &str) -> Result<PlaylistHead> {
 
 pub async fn album(session: &Session, id: &str) -> Result<(Album, Vec<String>)> {
     let sid = SpotifyId::from_base62(id).map_err(|_| anyhow!("bad album id"))?;
-    let bytes = session
-        .spclient()
-        .get_album_metadata(&SpotifyUri::Album { id: sid })
+    let bytes = within(session.spclient().get_album_metadata(&SpotifyUri::Album { id: sid }))
         .await
         .map_err(err)?;
     let a = pb::Album::parse_from_bytes(&bytes)?;
@@ -380,9 +413,7 @@ pub struct ArtistHead {
 
 pub async fn artist(session: &Session, id: &str) -> Result<ArtistHead> {
     let sid = SpotifyId::from_base62(id).map_err(|_| anyhow!("bad artist id"))?;
-    let bytes = session
-        .spclient()
-        .get_artist_metadata(&SpotifyUri::Artist { id: sid })
+    let bytes = within(session.spclient().get_artist_metadata(&SpotifyUri::Artist { id: sid }))
         .await
         .map_err(err)?;
     let a = pb::Artist::parse_from_bytes(&bytes)?;
@@ -431,7 +462,7 @@ pub async fn artist(session: &Session, id: &str) -> Result<ArtistHead> {
 /// Spotify's own time-synced lyrics, when the track has them.
 pub async fn lyrics(session: &Session, track_id: &str) -> Option<Lyrics> {
     let sid = SpotifyId::from_base62(track_id).ok()?;
-    let bytes = session.spclient().get_lyrics(&sid).await.ok()?;
+    let bytes = within(session.spclient().get_lyrics(&sid)).await.ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let inner = &v["lyrics"];
     let synced = inner["syncType"].as_str() == Some("LINE_SYNCED");
@@ -566,9 +597,8 @@ async fn collection_call(session: &Session, verb: &str, body: Vec<u8>) -> Result
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(KIND));
     headers.insert(ACCEPT, HeaderValue::from_static(KIND));
-    let bytes = session
-        .spclient()
-        .request(&Method::POST, &format!("/collection/v2/{verb}"), Some(headers), Some(&body))
+    let endpoint = format!("/collection/v2/{verb}");
+    let bytes = within(session.spclient().request(&Method::POST, &endpoint, Some(headers), Some(&body)))
         .await
         .map_err(err)?;
     Ok(bytes.to_vec())
@@ -668,14 +698,8 @@ pub async fn queue_add(session: &Session, uri: &str) -> Result<()> {
     .to_string();
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    session
-        .spclient()
-        .request(
-            &Method::POST,
-            &format!("/connect-state/v1/player/command/from/{device}/to/{device}"),
-            Some(headers),
-            Some(body.as_bytes()),
-        )
+    let endpoint = format!("/connect-state/v1/player/command/from/{device}/to/{device}");
+    within(session.spclient().request(&Method::POST, &endpoint, Some(headers), Some(body.as_bytes())))
         .await
         .map(|_| ())
         .map_err(err)
@@ -685,11 +709,8 @@ pub async fn queue_add(session: &Session, uri: &str) -> Result<()> {
 /// track URIs in ranked order.
 pub async fn search_tracks(session: &Session, query: &str) -> Result<Vec<String>> {
     let q: String = query.split_whitespace().collect::<Vec<_>>().join("+");
-    let ctx = session
-        .spclient()
-        .get_context(&format!("spotify:search:{}", urlencode(&q)))
-        .await
-        .map_err(err)?;
+    let uri = format!("spotify:search:{}", urlencode(&q));
+    let ctx = within(session.spclient().get_context(&uri)).await.map_err(err)?;
     Ok(ctx
         .pages
         .iter()

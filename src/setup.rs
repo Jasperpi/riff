@@ -170,5 +170,7 @@ pub async fn ensure(cfg: &mut Config, redo_setup: bool, redo_login: bool) -> Res
 pub fn logout() {
     std::fs::remove_file(auth::token_path()).ok();
     std::fs::remove_file(engine::session_dir().join("credentials.json")).ok();
+    // The saved library belongs to the account that just left.
+    std::fs::remove_dir_all(crate::config::cache_dir().join("data")).ok();
     println!("Signed out. Run `riff` to sign in again.");
 }

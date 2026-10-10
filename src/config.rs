@@ -18,12 +18,16 @@ pub struct Config {
     pub bitrate: u16,
     pub normalize: bool,
     pub audio_cache: bool,
-    /// blocks | ascii | braille | off
+    /// blocks | ascii | braille | pulse | depth
     pub art: String,
     /// Tint the interface with the colours of the current album.
     pub dynamic_color: bool,
     pub visualizer: bool,
     pub mouse: bool,
+    /// Blend the end of each song into the start of the next.
+    pub mix: bool,
+    /// Length of that blend, 1-12.
+    pub mix_seconds: u8,
 }
 
 impl Default for Config {
@@ -40,6 +44,8 @@ impl Default for Config {
             dynamic_color: true,
             visualizer: true,
             mouse: true,
+            mix: false,
+            mix_seconds: 6,
         }
     }
 }
@@ -75,6 +81,7 @@ impl Config {
             cfg.save().ok();
         }
         cfg.volume = cfg.volume.min(100);
+        cfg.mix_seconds = cfg.mix_seconds.clamp(1, 12);
         Ok(cfg)
     }
 

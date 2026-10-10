@@ -7,6 +7,7 @@ description = "A fast, beautiful Spotify client for the terminal"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+cpal = "0.16"
 crossterm = { version = "0.29", features = ["event-stream"] }
 dirs = "6"
 futures = "0.3"
@@ -30,6 +31,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 souvlaki = "0.8"
 toml = "0.9"
 unicode-width = "0.2"
+# The depth cover style: a small depth-estimation model, run with ONNX Runtime.
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["std", "download-binaries", "tls-native"] }
+
+[features]
+# `cargo install --path . --features depth` adds the cover style that gives
+# album art depth. It links ONNX Runtime (about 25 MB) and fetches a 27 MB
+# model the first time the style is used.
+depth = ["dep:ort"]
 
 [profile.dev]
 opt-level = 1

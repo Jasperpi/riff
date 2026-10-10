@@ -14,7 +14,7 @@ use crate::app::{App, Focus, Hit, LyricState, Overlay, Page, Screen};
 use crate::art::{self, ArtMode, Rgb};
 use crate::engine::Conn;
 use crate::model::*;
-use crate::viz::BANDS;
+use crate::audio::BANDS;
 
 struct Theme {
     bg: Rgb,
@@ -145,17 +145,41 @@ fn draw_art(buf: &mut Buffer, app: &mut App, th: &Theme, area: Rect, url: Option
         );
         return;
     };
-    let mode = if app.art_mode == ArtMode::Off { ArtMode::Blocks } else { app.art_mode };
-    let key = (url.to_string(), area.width, area.height, mode);
-    let rendered = match app.art_cache.get(&key) {
-        Some(r) => r.clone(),
-        None => {
-            let r = Arc::new(art::render(&image, area.width, area.height, mode));
-            if app.art_cache.len() > 48 {
-                app.art_cache.clear();
+    app.art_rects.push(area);
+    let mode = app.art_mode;
+    let rendered = if mode == ArtMode::Pulse {
+        // Redrawn every frame from a small copy, shaped by the music right now.
+        // Snapped to steps, so a quiet passage settles into a still image
+        // instead of repainting imperceptible changes.
+        let fx = art::Fx {
+            beat: (app.beat * 24.0).round() / 24.0,
+            bass: (app.bass * 10.0).round() / 10.0,
+            time: app.clock,
+        };
+        let source = app.thumbs.get(url).cloned().unwrap_or(image);
+        Arc::new(art::render_pulse(&source, area.width, area.height, fx))
+    } else if let (ArtMode::Depth, true, Some(depth)) = (mode, area.width >= 12, app.depths.get(url).cloned()) {
+        // Likewise redrawn every frame. Covers too small to show it stay still.
+        let fx = art::Fx { beat: (app.beat * 24.0).round() / 24.0, bass: (app.bass * 10.0).round() / 10.0, time: app.clock };
+        let source = app.thumbs.get(url).cloned().unwrap_or(image);
+        Arc::new(art::render_depth(&source, &depth, area.width, area.height, fx))
+    } else {
+        if mode == ArtMode::Depth && area.width >= 12 {
+            // Shown plain until its depth has been worked out.
+            let wanted = url.to_string();
+            app.want_depth(&wanted);
+        }
+        let key = (url.to_string(), area.width, area.height, mode);
+        match app.art_cache.get(&key) {
+            Some(r) => r.clone(),
+            None => {
+                let r = Arc::new(art::render(&image, area.width, area.height, mode));
+                if app.art_cache.len() > 48 {
+                    app.art_cache.clear();
+                }
+                app.art_cache.insert(key, r.clone());
+                r
             }
-            app.art_cache.insert(key, r.clone());
-            r
         }
     };
     for row in 0..rendered.h {
@@ -209,10 +233,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let th = theme(app);
     app.hits.clear();
+    app.art_rects.clear();
     let buf = f.buffer_mut();
     fill(buf, area, Style::default().bg(rgb(th.bg)).fg(th.text));
 
-    if area.width < 36 || area.height < 8 {
+    if area.width < 36 || area.height < 10 {
         put_centered(buf, area, area.y + area.height / 2, "riff needs a bigger window", Style::default().fg(th.dim));
         return;
     }
@@ -225,10 +250,107 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::Browse => draw_browse(buf, app, &th, body),
         Screen::NowPlaying => draw_now_playing(buf, app, &th, body),
+        Screen::Decks => draw_decks(buf, app, &th, body),
     }
-    draw_player(buf, app, &th, bar);
+    if app.decks_on() {
+        draw_decks_bar(buf, app, &th, bar);
+    } else {
+        draw_player(buf, app, &th, bar);
+    }
     draw_hints(buf, app, &th, hints);
     draw_overlay(buf, app, &th, area);
+    if app.party {
+        party(buf, app, &th, area);
+    }
+}
+
+/// Party mode: a pass over the finished frame that makes all of it move with
+/// the music. A spectrum closes in behind everything from all four edges, the
+/// colours wheel round and jump on each beat, the screen flashes on the kick
+/// and rows of text sway. Cover art keeps its own colours.
+fn party(buf: &mut Buffer, app: &App, th: &Theme, area: Rect) {
+    let (w, h) = (area.width as usize, area.height as usize);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let beat = app.beat;
+    let base_hue = app.beats as f32 * 47.0 + app.clock * 28.0;
+    let luma = |c: Color, fallback: f32| match c {
+        Color::Rgb(r, g, b) => (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0,
+        _ => fallback,
+    };
+    let base_luma = luma(rgb(th.bg), 0.05);
+    // Colours are snapped to steps so cells that haven't really changed are
+    // not resent to the terminal on every frame.
+    let step = |v: f32, n: f32| (v * n).round() / n;
+    let band = |t: f32| app.bars[((t * (BANDS - 1) as f32) as usize).min(BANDS - 1)];
+    // How far towards the centre line a full bar gets. Cells are about twice
+    // as tall as they are wide, so the side bars stop sooner to look as deep.
+    const REACH_TALL: f32 = 0.9;
+    const REACH_WIDE: f32 = 0.5;
+
+    for y in 0..h {
+        let row = area.y + y as u16;
+        for x in 0..w {
+            let col = area.x + x as u16;
+            if app.art_rects.iter().any(|r| col >= r.x && col < r.right() && row >= r.y && row < r.bottom()) {
+                continue;
+            }
+            let Some(cell) = buf.cell_mut((col, row)) else { continue };
+            // Bars reach in from all four edges: lows in the middle of each
+            // edge, highs towards the corners. `across` and `down` run from 0
+            // on the centre line to 1 at the edge.
+            let across = ((x as f32 + 0.5) / w as f32 - 0.5).abs() * 2.0;
+            let down = ((y as f32 + 0.5) / h as f32 - 0.5).abs() * 2.0;
+            // How far each cell sits under the tip of the bar covering it,
+            // from the top or bottom edge and from the left or right one.
+            let under = (band(across) * REACH_TALL - (1.0 - down)).max(band(down) * REACH_WIDE - (1.0 - across));
+            let hue = step((base_hue + across.max(down) * 110.0 + across.min(down) * 50.0) / 360.0, 40.0) * 360.0;
+
+            let raised = luma(cell.bg, base_luma) > base_luma + 0.02;
+            let mut light = 0.05 + beat * 0.075;
+            if under > 0.0 {
+                // Brightest just under the tip of each bar.
+                light += 0.07 + 0.11 * (1.0 - under.min(1.0));
+            }
+            if raised {
+                light += 0.07;
+            }
+            let bg = art::hsl_to_rgb(hue, 0.78, step(light.min(0.34), 48.0));
+            cell.set_bg(rgb(bg));
+
+            if cell.symbol() != " " {
+                let strength = luma(cell.fg, 0.9);
+                let fg = if strength > 0.80 {
+                    art::mix((255, 255, 255), art::hsl_to_rgb(hue + 40.0, 1.0, 0.8), 0.18)
+                } else if strength > 0.42 {
+                    art::hsl_to_rgb(hue + 160.0, 0.95, 0.74)
+                } else {
+                    art::hsl_to_rgb(hue + 160.0, 0.7, 0.58)
+                };
+                cell.set_fg(rgb(fg));
+            }
+        }
+    }
+
+    // Sway: rows slide sideways in a travelling wave that kicks on the beat.
+    // The bottom line stays put so the key hints remain readable.
+    if beat > 0.05 {
+        let width = buf.area.width as usize;
+        for y in 0..h.saturating_sub(1) {
+            let shift = ((app.clock * 2.4 + y as f32 * 0.55).sin() * (0.2 + 2.3 * beat)).round() as isize;
+            if shift == 0 {
+                continue;
+            }
+            let start = (area.y as usize + y - buf.area.y as usize) * width;
+            let cells = &mut buf.content[start..start + width];
+            if shift > 0 {
+                cells.rotate_right(shift as usize % width);
+            } else {
+                cells.rotate_left((-shift) as usize % width);
+            }
+        }
+    }
 }
 
 // ---- browse ---------------------------------------------------------------
@@ -347,6 +469,7 @@ fn draw_main(buf: &mut Buffer, app: &mut App, th: &Theme, area: Rect) {
     let is_playing = app.pb.playing;
     let eq = [app.bars[3], app.bars[14], app.bars[28]];
     let liked = &app.liked;
+    let marked: std::collections::HashSet<&str> = app.basket.iter().map(|t| t.uri.as_str()).collect();
     let Some(page) = app.pages.last_mut() else { return };
 
     let x = area.x + 2;
@@ -400,7 +523,7 @@ fn draw_main(buf: &mut Buffer, app: &mut App, th: &Theme, area: Rect) {
     }
 
     let list = Rect { x: area.x, y, width: area.width, height: area.bottom().saturating_sub(y) };
-    draw_list(buf, &mut app.hits, th, list, page, focused, frame, &playing_uri, is_playing, eq, liked);
+    draw_list(buf, &mut app.hits, th, list, page, focused, frame, &playing_uri, is_playing, eq, liked, &marked);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -416,6 +539,7 @@ fn draw_list(
     is_playing: bool,
     eq: [f32; 3],
     liked: &std::collections::HashSet<String>,
+    marked: &std::collections::HashSet<&str>,
 ) {
     let tab = page.cur_mut();
     if area.height < 2 {
@@ -501,7 +625,14 @@ fn draw_list(
                     th.text
                 };
                 let second = if t.playable { th.dim } else { th.faint };
-                if current && is_playing {
+                let is_marked = marked.contains(t.uri.as_str());
+                if is_marked {
+                    // Selected for the queue: a tinted row with a tick in the margin.
+                    if !selected {
+                        fill(buf, row_rect, Style::default().bg(rgb(art::mix(th.bg, th.accent_rgb, 0.11))));
+                    }
+                    put_right(buf, x + 3, ry, 3, "✓", Style::default().fg(th.accent).add_modifier(Modifier::BOLD));
+                } else if current && is_playing {
                     for (i, v) in eq.iter().enumerate() {
                         set(buf, x + 1 + i as u16, ry, bar_glyph(v.max(0.12)), Style::default().fg(th.accent));
                     }
@@ -599,7 +730,7 @@ fn draw_now_playing(buf: &mut Buffer, app: &mut App, th: &Theme, body: Rect) {
     let top = Rect { height: body.height - viz_h, ..body };
     let pad = 3u16;
 
-    let show_art = app.art_mode != ArtMode::Off && top.height >= 9 && top.width >= 50;
+    let show_art = top.height >= 9 && top.width >= 50;
     let art_h = if show_art {
         (top.height.saturating_sub(2)).min(top.width * 45 / 100 / 2).min(40)
     } else {
@@ -730,18 +861,226 @@ fn draw_up_next(buf: &mut Buffer, app: &App, th: &Theme, pane: Rect, lyrics_miss
     }
 }
 
+// ---- DJ decks -------------------------------------------------------------
+
+/// The crossfader: a track with a handle, A on the left and B on the right.
+fn draw_fader(buf: &mut Buffer, th: &Theme, x: u16, y: u16, width: u16, value: f32) {
+    if width < 8 {
+        return;
+    }
+    let track = width - 4;
+    put(buf, x, y, 1, "A", Style::default().fg(if value < 0.5 { th.accent } else { th.faint }).add_modifier(Modifier::BOLD));
+    put(buf, x + width - 1, y, 1, "B", Style::default().fg(if value > 0.5 { th.accent } else { th.faint }).add_modifier(Modifier::BOLD));
+    let handle = (value.clamp(0.0, 1.0) * (track - 1) as f32).round() as u16;
+    for i in 0..track {
+        let (ch, color) = if i == handle { ('●', th.text) } else if i == track / 2 { ('┼', th.dim) } else { ('━', th.faint) };
+        set(buf, x + 2 + i, y, ch, Style::default().fg(color));
+    }
+}
+
+fn draw_deck(buf: &mut Buffer, app: &mut App, th: &Theme, area: Rect, d: usize) {
+    let deck = app.decks.decks[d].clone();
+    let focused = app.deck_focus == d;
+    let heard = if d == 0 { 1.0 - app.decks.fader } else { app.decks.fader };
+    let x = area.x + 2;
+    let w = area.width.saturating_sub(4);
+    let mut y = area.y + 1;
+
+    // Header: which deck, a light that flashes on its beat, and its state.
+    let label = format!("{} DECK {}", if focused { "▸" } else { " " }, crate::dj::deck_name(d));
+    let used = put(buf, x, y, w, &label, Style::default().fg(if focused { th.accent } else { th.dim }).add_modifier(Modifier::BOLD));
+    let on_beat = deck.playing && deck.meter.phase.is_some_and(|p| p < 0.18);
+    put(buf, x + used + 1, y, 1, "●", Style::default().fg(if on_beat { th.text } else { th.faint }));
+    let state = if deck.failed {
+        "can't be played"
+    } else if deck.loading {
+        "loading"
+    } else if deck.track.is_none() {
+        "empty"
+    } else if deck.ended {
+        "finished"
+    } else if deck.playing && heard < 0.02 {
+        "playing, silent"
+    } else if deck.playing {
+        "playing"
+    } else {
+        "cued"
+    };
+    put_right(buf, x + w, y, 16, state, Style::default().fg(if deck.playing { th.accent } else { th.faint }));
+    y += 2;
+
+    let Some(track) = deck.track.clone() else {
+        put(buf, x, y, w, &format!("Press {} on a song to load it here", d + 1), Style::default().fg(th.faint));
+        return;
+    };
+
+    // Cover, with the song beside it.
+    let art_h = (area.height.saturating_sub(8)).clamp(3, 7).min(w / 4);
+    let art = Rect { x, y, width: art_h * 2, height: art_h };
+    if area.height >= 12 && w >= 30 {
+        draw_art(buf, app, th, art, track.image.as_deref());
+    }
+    let tx = if area.height >= 12 && w >= 30 { art.right() + 2 } else { x };
+    let tw = (x + w).saturating_sub(tx);
+    put(buf, tx, y, tw, &track.name, Style::default().fg(th.text).add_modifier(Modifier::BOLD));
+    put(buf, tx, y + 1, tw, &track.artist_line(), Style::default().fg(th.dim));
+    // Tempo as it is being heard, and how far it has been bent.
+    let tempo = match deck.meter.bpm {
+        Some(bpm) => format!("{bpm:.1} BPM"),
+        None if deck.playing => "finding the beat…".to_string(),
+        None => "– BPM".to_string(),
+    };
+    let used = put(buf, tx, y + 3, tw, &tempo, Style::default().fg(th.text));
+    if deck.bend.abs() > 0.0005 {
+        put(buf, tx + used + 2, y + 3, 8, &format!("{:+.1}%", deck.bend * 100.0), Style::default().fg(th.accent));
+    }
+    if app.decks.locked == Some(d) {
+        put_right(buf, x + w, y + 3, 10, "on beat", Style::default().fg(th.accent));
+    }
+    y += art_h.max(4) + 1;
+
+    // Level meter and progress.
+    if y + 2 < area.bottom() {
+        let cells = (deck.meter.level.clamp(0.0, 1.0).sqrt() * w as f32) as u16;
+        for i in 0..w {
+            set(buf, x + i, y, if i < cells { '▮' } else { '▯' }, Style::default().fg(if i < cells { th.accent } else { th.faint }));
+        }
+        y += 1;
+        let glyph = if deck.loading { spinner(app.frame).to_string() } else if deck.playing { "❚❚".into() } else { "▶".into() };
+        put(buf, x, y, 2, &glyph, Style::default().fg(th.accent).add_modifier(Modifier::BOLD));
+        let ew = put(buf, x + 3, y, 7, &fmt_ms(deck.pos_ms), Style::default().fg(th.dim));
+        let tw = put_right(buf, x + w, y, 7, &fmt_ms(track.duration_ms), Style::default().fg(th.dim));
+        let bx = x + 4 + ew;
+        let bw = (x + w).saturating_sub(tw + 1).saturating_sub(bx);
+        if bw >= 4 && track.duration_ms > 0 {
+            let filled = ((deck.pos_ms as f64 / track.duration_ms as f64).min(1.0) * bw as f64).round() as u16;
+            for i in 0..bw {
+                let (ch, color) = if i < filled { ('━', th.accent) } else { ('─', th.faint) };
+                set(buf, bx + i, y, ch, Style::default().fg(color));
+            }
+            set(buf, bx + filled.min(bw - 1), y, '●', Style::default().fg(th.text));
+        }
+        y += 2;
+    }
+
+    if y < area.bottom() {
+        draw_eq(buf, th, x, y, w, deck.eq, deck.meter.bands, focused);
+    }
+}
+
+/// A deck's three EQ knobs, each beside a meter of what that band is putting out.
+fn draw_eq(buf: &mut Buffer, th: &Theme, x: u16, y: u16, w: u16, eq: [i8; 3], bands: [f32; 3], focused: bool) {
+    use crate::dj::{EQ_KILL, EQ_MAX};
+    let slots = (EQ_MAX - EQ_KILL + 1) as u16;
+    // Label, meter and knob track when there is room; otherwise the setting in words.
+    let full = w >= 3 * (6 + slots) + 4;
+    let each = if full { 6 + slots + 2 } else { 12 };
+    for band in 0..3u16 {
+        let bx = x + band * each;
+        if bx + if full { 6 + slots } else { 10 } > x + w {
+            break;
+        }
+        let step = eq[band as usize];
+        let killed = step == EQ_KILL;
+        let name = ["LOW", "MID", "HI"][band as usize];
+        let tone = if killed { th.error } else if focused { th.text } else { th.dim };
+        put(buf, bx, y, 3, name, Style::default().fg(tone).add_modifier(Modifier::BOLD));
+        let level = bands[band as usize].clamp(0.0, 1.0).sqrt();
+        set(buf, bx + 4, y, bar_glyph(level), Style::default().fg(if killed { th.faint } else { th.accent }));
+        if !full {
+            put(buf, bx + 6, y, 6, crate::dj::eq_label(step).trim_end_matches(" dB"), Style::default().fg(tone));
+            continue;
+        }
+        let at = (step - EQ_KILL) as u16;
+        for i in 0..slots {
+            let (ch, color) = if i == at {
+                (if killed { '✕' } else { '●' }, tone)
+            } else if i < at {
+                ('━', if focused { th.accent } else { th.dim })
+            } else if i == (-EQ_KILL) as u16 {
+                // Where flat is, when the knob is below it.
+                ('┆', th.faint)
+            } else {
+                ('─', th.faint)
+            };
+            set(buf, bx + 6 + i, y, ch, Style::default().fg(color));
+        }
+    }
+}
+
+fn draw_decks(buf: &mut Buffer, app: &mut App, th: &Theme, body: Rect) {
+    let viz_h = if app.cfg.visualizer && body.height >= 24 { (body.height / 6).clamp(3, 6) } else { 0 };
+    let fader_h = 4;
+    let decks_h = body.height.saturating_sub(viz_h + fader_h);
+    let half = body.width / 2;
+    draw_deck(buf, app, th, Rect { x: body.x, y: body.y, width: half, height: decks_h }, 0);
+    draw_deck(buf, app, th, Rect { x: body.x + half, y: body.y, width: body.width - half, height: decks_h }, 1);
+    for y in body.y + 1..body.y + decks_h {
+        set(buf, body.x + half, y, '│', Style::default().fg(rgb(art::mix(th.bg, (255, 255, 255), 0.09))));
+    }
+
+    // Crossfader, with what a transition in progress is up to.
+    let fy = body.y + decks_h + 1;
+    let fw = (body.width * 3 / 5).clamp(20, 70).min(body.width.saturating_sub(4));
+    draw_fader(buf, th, body.x + (body.width - fw) / 2, fy, fw, app.decks.fader);
+    let status = match app.decks.auto {
+        Some((to, _, true)) => format!("listening to deck {} to find its beat…", crate::dj::deck_name(to)),
+        Some((to, progress, false)) => format!("mixing in deck {} · {:.0}%", crate::dj::deck_name(to), progress * 100.0),
+        None if app.decks.locked.is_some() => "decks are beat-matched".to_string(),
+        None => String::new(),
+    };
+    put_centered(buf, body, fy + 1, &status, Style::default().fg(th.accent));
+
+    if viz_h > 0 {
+        let viz = Rect { x: body.x + 3, y: body.bottom() - viz_h, width: body.width.saturating_sub(6), height: viz_h - 1 };
+        draw_spectrum(buf, app, th, viz, 1);
+    }
+}
+
+/// With the decks on, the bottom bar shows both of them at a glance.
+fn draw_decks_bar(buf: &mut Buffer, app: &mut App, th: &Theme, bar: Rect) {
+    fill(buf, bar, Style::default().bg(rgb(th.panel)));
+    let x = bar.x + 2;
+    let w = bar.width.saturating_sub(4);
+    let compact = bar.height < 5;
+    for d in 0..2 {
+        let deck = &app.decks.decks[d];
+        let y = if compact { bar.y + d as u16 } else { bar.y + 1 + d as u16 };
+        let glyph = if deck.playing { "▶" } else { "‖" };
+        let mut cx = x + put(buf, x, y, 4, &format!("{} {} ", crate::dj::deck_name(d), glyph), Style::default().fg(if deck.playing { th.accent } else { th.faint }).add_modifier(Modifier::BOLD));
+        match &deck.track {
+            Some(t) => {
+                cx += put(buf, cx, y, w.saturating_sub(34), &t.name, Style::default().fg(if deck.playing { th.text } else { th.dim }));
+                put(buf, cx, y, (x + w).saturating_sub(cx + 22), &format!(" · {}", t.artist_line()), Style::default().fg(th.faint));
+                let right = format!("{}  {}", deck.meter.bpm.map(|b| format!("{b:.0} BPM")).unwrap_or_default(), fmt_ms(deck.pos_ms));
+                put_right(buf, x + w, y, 20, &right, Style::default().fg(th.dim));
+            }
+            None => {
+                put(buf, cx, y, w, &format!("empty: press {} on a song", d + 1), Style::default().fg(th.faint));
+            }
+        }
+    }
+    if !compact {
+        let fw = (w / 2).clamp(16, 44);
+        draw_fader(buf, th, x, bar.y + 3, fw, app.decks.fader);
+        if app.screen != Screen::Decks {
+            put_right(buf, x + w, bar.y + 3, 24, "D opens the decks", Style::default().fg(th.faint));
+        }
+    }
+}
+
 // ---- player bar -----------------------------------------------------------
 
 fn draw_player(buf: &mut Buffer, app: &mut App, th: &Theme, bar: Rect) {
     fill(buf, bar, Style::default().bg(rgb(th.panel)));
     let compact = bar.height < 5;
     let track = app.pb.track.clone();
-    let pos = app.pb.position();
+    let pos = app.position();
     let dur = track.as_ref().map(|t| t.duration_ms).unwrap_or(0);
 
     // Left: artwork tile (also a button to open the now-playing screen).
     let mut x = bar.x + 2;
-    if !compact && app.art_mode != ArtMode::Off && app.screen == Screen::Browse {
+    if !compact && app.screen == Screen::Browse {
         let art_rect = Rect { x: bar.x + 2, y: bar.y + 1, width: 6, height: 3 };
         let url = track.as_ref().and_then(|t| t.image.clone());
         draw_art(buf, app, th, art_rect, url.as_deref());
@@ -749,7 +1088,7 @@ fn draw_player(buf: &mut Buffer, app: &mut App, th: &Theme, bar: Rect) {
         x = art_rect.right() + 2;
     }
 
-    let right_w: u16 = if bar.width >= 96 { 30 } else if bar.width >= 72 { 18 } else { 0 };
+    let right_w: u16 = if bar.width >= 100 { 38 } else if bar.width >= 72 { 18 } else { 0 };
     let text_w = bar.right().saturating_sub(x + right_w + 3);
     let title_y = if compact { bar.y } else { bar.y + 1 };
 
@@ -796,7 +1135,8 @@ fn draw_player(buf: &mut Buffer, app: &mut App, th: &Theme, bar: Rect) {
                 Repeat::Context => "↻ all",
                 Repeat::Track => "↻ one",
             };
-            put(buf, sx, sy, 9, rep, on(app.pb.repeat != Repeat::Off));
+            sx += put(buf, sx, sy, 9, rep, on(app.pb.repeat != Repeat::Off)) + 2;
+            put(buf, sx, sy, 6, "≈ fade", on(app.cfg.mix));
         }
         let vol = format!("vol {:>3}%", app.pb.volume);
         put_right(buf, bar.right() - 2, sy, 9, &vol, Style::default().fg(th.dim));
@@ -880,14 +1220,36 @@ fn draw_hints(buf: &mut Buffer, app: &mut App, th: &Theme, area: Rect) {
         }
     }
 
+    // With songs selected, say so and say what can be done with them.
+    if !app.basket.is_empty() && matches!(app.overlay, Overlay::None) {
+        let n = app.basket.len();
+        let label = format!("✓ {n} selected ");
+        x += put(buf, x, y, 16, &label, Style::default().fg(th.accent).add_modifier(Modifier::BOLD)) + 1;
+    }
+    let selecting = !app.basket.is_empty();
     let hints: &[(&str, &str)] = match (&app.overlay, app.screen, app.focus) {
+        (Overlay::Help { .. }, _, _) => &[("↑↓", "more keys"), ("esc", "close")],
+        (Overlay::Search { .. }, _, _) => &[("enter", "search"), ("esc", "cancel")],
         (Overlay::Queue { .. }, _, _) => &[("↑↓", "browse"), ("esc", "close")],
         (Overlay::Devices { .. }, _, _) => &[("enter", "play there"), ("esc", "close")],
+        (_, Screen::Decks, _) => {
+            &[("a b", "play"), ("← →", "crossfade"), ("m", "mix in"), ("s", "sync"), ("uio jkl", "eq"), ("x", "bass here"), ("tab", "deck"), (",.", "seek"), ("[ ]", "tempo"), ("esc", "songs"), ("D", "off")]
+        }
+        (_, Screen::Browse, Focus::Main) if app.decks_on() => {
+            &[("1 2", "load deck A / B"), ("enter", "load a deck"), ("m", "mix in"), ("D", "decks"), ("/", "search"), ("?", "all keys")]
+        }
+        (_, Screen::Browse, Focus::Main) if app.selecting_range() => {
+            &[("↑↓", "extend the run"), ("V", "done"), ("a", "queue them"), ("enter", "play them")]
+        }
+        (_, Screen::NowPlaying, _) if app.decks_on() => {
+            &[("space", "pause"), (",.", "seek"), ("m", "mix in"), ("↑↓", "lyrics"), ("D", "decks"), ("z", "party"), ("esc", "back")]
+        }
         (_, Screen::NowPlaying, _) => {
-            &[("space", "pause"), (",.", "seek"), ("n p", "skip"), ("f", "like"), ("c", "cover style"), ("↑↓", "lyrics"), ("esc", "back")]
+            &[("space", "pause"), (",.", "seek"), ("n p", "skip"), ("f", "like"), ("c", "cover"), ("D", "decks"), ("z", "party"), ("esc", "back")]
         }
         (_, _, Focus::Sidebar) => &[("enter", "open"), ("→", "tracks"), ("/", "search"), ("v", "now playing"), ("?", "all keys")],
-        _ => &[("enter", "play"), ("a", "queue"), ("f", "like"), ("/", "search"), ("o", "album"), ("v", "now playing"), ("?", "all keys")],
+        _ if selecting => &[("enter", "play them"), ("a", "queue them"), ("x", "more"), ("V", "a run"), ("X", "clear"), ("/", "search")],
+        _ => &[("enter", "play"), ("x", "select"), ("a", "queue"), ("f", "like"), ("/", "search"), ("v", "now playing"), ("D", "decks"), ("?", "all keys")],
     };
     let limit = area.right().saturating_sub(right_used + 4);
     for (key, label) in hints {
@@ -948,13 +1310,12 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             ("space", "play / pause"),
             ("n  p", "next / previous"),
-            (",  .", "seek 5 seconds"),
+            (",  .", "seek 5 s (hold to scrub)"),
             ("<  >", "seek 30 seconds"),
             ("-  +", "volume"),
-            ("s", "shuffle"),
-            ("r", "repeat: off, all, one"),
-            ("d", "choose device"),
-            ("u", "up next"),
+            ("s  r", "shuffle / repeat"),
+            ("m  M", "crossfade songs / length"),
+            ("d  u", "devices / up next"),
         ],
     ),
     (
@@ -964,6 +1325,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("← →", "sidebar / list"),
             ("enter", "play or open"),
             ("tab", "next tab"),
+            ("[  ]", "previous / next tab"),
+            ("pgup pgdn", "jump ten rows"),
             ("esc", "back"),
             ("/", "search Spotify"),
             ("ctrl-f", "filter this list"),
@@ -972,66 +1335,123 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
-        "Track",
+        "Build a queue",
         &[
-            ("a", "add to queue"),
-            ("f", "like / unlike"),
-            ("F", "like what's playing"),
-            ("o", "go to album"),
-            ("A", "go to artist"),
+            ("x", "select (or ctrl-click)"),
+            ("J  K", "select while moving"),
+            ("V", "run: V, move, V again"),
+            ("a", "queue selection or song"),
+            ("enter", "play the selection now"),
+            ("X", "clear the selection"),
         ],
     ),
     (
-        "View",
+        "DJ decks",
         &[
+            ("D", "decks (again: off)"),
+            ("1  2", "load song on deck A / B"),
+            ("a  b", "play / pause deck A / B"),
+            ("← →", "crossfader (↓ centre)"),
+            ("m  M", "mix in / mix length"),
+            ("tab", "deck the keys act on"),
+            ("u i o", "low / mid / high up"),
+            ("j k l", "low / mid / high down"),
+            ("J K L", "kill (U I O: flat)"),
+            ("x", "bass to this deck"),
+            ("s", "match tempo and beat"),
+            ("[ ] 0", "tempo down / up / reset"),
+            ("{ }", "nudge earlier / later"),
+        ],
+    ),
+    (
+        "Track & view",
+        &[
+            ("f  F", "like song / like playing"),
+            ("o  A", "go to album / artist"),
             ("v", "now playing + lyrics"),
-            ("c", "cover style"),
-            ("?", "this help"),
-            ("q", "quit"),
+            ("c", "cover style (pulse, depth)"),
+            ("z", "party mode"),
+            ("?  q", "this help / quit"),
         ],
     ),
 ];
 
+/// Lines a column of help sections takes: a heading and its keys each, with
+/// a blank line between sections.
+fn help_rows(sections: &[usize]) -> usize {
+    sections.iter().map(|&n| HELP[n].1.len() + 1).sum::<usize>() + sections.len().saturating_sub(1)
+}
+
+/// Lay the help out as pages of `cols` columns, each `rows` lines tall. A
+/// section is never split, so a short window gets more pages, not cut-off keys.
+fn help_pages(cols: usize, rows: usize) -> Vec<Vec<Vec<usize>>> {
+    let mut pages: Vec<Vec<Vec<usize>>> = vec![vec![Vec::new()]];
+    for n in 0..HELP.len() {
+        let page = pages.last_mut().unwrap();
+        // The first column on this page with room for it.
+        let fits = page.iter().position(|col| {
+            let mut with = col.clone();
+            with.push(n);
+            col.is_empty() || help_rows(&with) <= rows
+        });
+        match fits {
+            Some(c) => page[c].push(n),
+            None if page.len() < cols => page.push(vec![n]),
+            None => pages.push(vec![vec![n]]),
+        }
+    }
+    pages
+}
+
 fn draw_overlay(buf: &mut Buffer, app: &mut App, th: &Theme, screen: Rect) {
     match &app.overlay {
         Overlay::None | Overlay::Filter => {}
-        Overlay::Help => {
-            let two_cols = screen.width >= 84;
-            let (w, h) = if two_cols { (80, 26) } else { (44, screen.height.saturating_sub(2)) };
-            let inner = popup(buf, th, screen, w, h, None, "Keys");
-            if !app.web_api() && inner.height > 3 {
+        Overlay::Help { page } => {
+            let cols: usize = if screen.width >= 126 { 3 } else if screen.width >= 80 { 2 } else { 1 };
+            // Rows left for keys once the frame, a line of air and the footer are taken.
+            let room = screen.height.saturating_sub(6).max(1) as usize;
+            let pages = help_pages(cols, room);
+            let tallest = pages.iter().flatten().map(|col| help_rows(col)).max().unwrap_or(0);
+            let inner = popup(buf, th, screen, [48, 88, 122][cols - 1], tallest as u16 + 4, None, "Keys");
+            let shown = *page % pages.len();
+            let footer = inner.bottom().saturating_sub(1);
+            let mut note_w = 0;
+            if pages.len() > 1 {
+                let note = format!("↓ more keys · {} of {}", shown + 1, pages.len());
+                note_w = put_right(buf, inner.right(), footer, inner.width, &note, Style::default().fg(th.accent));
+            }
+            if !app.web_api() {
                 put(
                     buf,
                     inner.x + 1,
-                    inner.bottom() - 1,
-                    inner.width.saturating_sub(2),
+                    footer,
+                    inner.width.saturating_sub(note_w + 3),
                     "`riff setup` adds playlist search, Recently Played, remote control",
                     Style::default().fg(th.faint),
                 );
             }
-            let col_w = if two_cols { inner.width / 2 } else { inner.width };
-            let mut col = 0u16;
-            let mut y = inner.y + 1;
-            for (n, (section, keys)) in HELP.iter().enumerate() {
-                if two_cols && n == 2 {
-                    col = 1;
-                    y = inner.y + 1;
-                }
-                let x = inner.x + 1 + col * col_w;
-                if y >= inner.bottom() {
-                    break;
-                }
-                put(buf, x, y, col_w, section, Style::default().fg(th.accent).add_modifier(Modifier::BOLD));
-                y += 1;
-                for (key, what) in *keys {
-                    if y >= inner.bottom() {
+            // A page that doesn't need every column gives the rest of the room to the text.
+            let col_w = inner.width / pages[shown].len().max(1) as u16;
+            for (c, sections) in pages[shown].iter().enumerate() {
+                let x = inner.x + 1 + c as u16 * col_w;
+                let mut y = inner.y + 1;
+                for &n in sections {
+                    let (section, keys) = HELP[n];
+                    if y >= footer {
                         break;
                     }
-                    put(buf, x, y, 9, key, Style::default().fg(th.text));
-                    put(buf, x + 10, y, col_w.saturating_sub(12), what, Style::default().fg(th.dim));
+                    put(buf, x, y, col_w, section, Style::default().fg(th.accent).add_modifier(Modifier::BOLD));
+                    y += 1;
+                    for (key, what) in keys {
+                        if y >= footer {
+                            break;
+                        }
+                        put(buf, x, y, 10, key, Style::default().fg(th.text));
+                        put(buf, x + 11, y, col_w.saturating_sub(12), what, Style::default().fg(th.dim));
+                        y += 1;
+                    }
                     y += 1;
                 }
-                y += 1;
             }
         }
         Overlay::Search { input } => {
@@ -1051,7 +1471,7 @@ fn draw_overlay(buf: &mut Buffer, app: &mut App, th: &Theme, screen: Rect) {
         }
         Overlay::Queue { sel } => {
             let sel = *sel;
-            let h = (app.queue.len() as u16 + 4).clamp(6, screen.height.saturating_sub(4));
+            let h = (app.queue.len() as u16 + 4).max(6).min(screen.height.saturating_sub(4));
             let inner = popup(buf, th, screen, 70, h, None, "Up next");
             if app.queue.is_empty() {
                 let msg = if app.pb.shuffle && !app.web_api() {
@@ -1080,7 +1500,7 @@ fn draw_overlay(buf: &mut Buffer, app: &mut App, th: &Theme, screen: Rect) {
         }
         Overlay::Devices { sel } => {
             let sel = *sel;
-            let h = (app.pb.devices.len() as u16 + 4).clamp(6, screen.height.saturating_sub(4));
+            let h = (app.pb.devices.len() as u16 + 4).max(6).min(screen.height.saturating_sub(4));
             let inner = popup(buf, th, screen, 56, h, None, "Play on");
             if app.pb.devices.is_empty() {
                 put(buf, inner.x + 1, inner.y + 1, inner.width, "No devices yet. Still connecting, or nothing is open.", Style::default().fg(th.dim));
@@ -1104,5 +1524,65 @@ fn draw_overlay(buf: &mut Buffer, app: &mut App, th: &Theme, screen: Rect) {
                 put_right(buf, inner.right(), y, 12, &d.kind, Style::default().fg(th.faint));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::demo;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn party_frame(level: f32) -> Buffer {
+        let mut app = demo::app(Config::default());
+        app.party = true;
+        app.bars = [level; BANDS];
+        // No beat, so rows stay where they are.
+        app.beat = 0.0;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn help_shows_every_section_whole_at_any_size() {
+        for (cols, rows) in [(1, 6), (1, 18), (2, 18), (2, 30), (3, 20), (3, 4)] {
+            let pages = help_pages(cols, rows);
+            let mut seen: Vec<usize> = pages.iter().flatten().flatten().copied().collect();
+            seen.sort();
+            assert_eq!(seen, (0..HELP.len()).collect::<Vec<_>>(), "{cols} columns of {rows}");
+            for column in pages.iter().flatten() {
+                assert!(column.len() == 1 || help_rows(column) <= rows, "{cols} columns of {rows}: a column runs over");
+            }
+            assert!(pages.iter().all(|page| page.len() <= cols));
+        }
+    }
+
+    #[test]
+    fn pop_ups_survive_a_very_short_window() {
+        use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        for height in 8..14 {
+            for key in ['u', 'd', '?'] {
+                let mut app = demo::app(Config::default());
+                app.on_term(Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)));
+                let mut terminal = Terminal::new(TestBackend::new(40, height)).unwrap();
+                terminal.draw(|f| draw(f, &mut app)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn party_spectrum_comes_in_from_every_edge() {
+        let (quiet, loud) = (party_frame(0.0), party_frame(0.5));
+        let glow = |buf: &Buffer, x: u16, y: u16| match buf[(x, y)].bg {
+            Color::Rgb(r, g, b) => r as u32 + g as u32 + b as u32,
+            _ => 0,
+        };
+        for (name, x, y) in [("top", 60, 0), ("bottom", 60, 39), ("left", 0, 20), ("right", 119, 20)] {
+            assert!(glow(&loud, x, y) > glow(&quiet, x, y), "nothing reaches in from the {name} edge");
+        }
+        assert_eq!(glow(&loud, 60, 20), glow(&quiet, 60, 20), "half-height bars should not reach the middle");
     }
 }
