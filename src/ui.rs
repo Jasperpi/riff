@@ -149,20 +149,40 @@ fn draw_art(buf: &mut Buffer, app: &mut App, th: &Theme, area: Rect, url: Option
     let mode = app.art_mode;
     let rendered = if mode == ArtMode::Pulse {
         // Redrawn every frame from a small copy, shaped by the music right now.
-        // Snapped to steps, so a quiet passage settles into a still image
-        // instead of repainting imperceptible changes.
-        let fx = art::Fx {
-            beat: (app.beat * 24.0).round() / 24.0,
-            bass: (app.bass * 10.0).round() / 10.0,
-            time: app.clock,
-        };
         let source = app.thumbs.get(url).cloned().unwrap_or(image);
-        Arc::new(art::render_pulse(&source, area.width, area.height, fx))
+        Arc::new(art::render_pulse(&source, area.width, area.height, app.art_fx()))
     } else if let (ArtMode::Depth, true, Some(depth)) = (mode, area.width >= 12, app.depths.get(url).cloned()) {
         // Likewise redrawn every frame. Covers too small to show it stay still.
-        let fx = art::Fx { beat: (app.beat * 24.0).round() / 24.0, bass: (app.bass * 10.0).round() / 10.0, time: app.clock };
+        // A pop-up would be hidden behind a picture, so those wait for it to close.
+        let clear = matches!(app.overlay, Overlay::None | Overlay::Filter);
+        if let (Some(screen), true) = (&app.pixels, clear && app.cfg.pictures) {
+            // As a real picture: the main loop sends it once the characters
+            // are drawn. The cells under it are left empty. A cover is square,
+            // which in cells depends on the shape of this terminal's font.
+            let (cw, ch) = (screen.cell.0 as f32, screen.cell.1 as f32);
+            let side = (area.width as f32 * cw).min(area.height as f32 * ch);
+            let cols = ((side / cw).round() as u16).clamp(1, area.width);
+            let rows = ((side / ch).round() as u16).clamp(1, area.height);
+            let cells = Rect {
+                x: area.x + (area.width - cols) / 2,
+                y: area.y + (area.height - rows) / 2,
+                width: cols,
+                height: rows,
+            };
+            for y in area.y..area.bottom() {
+                for x in area.x..area.right() {
+                    set(buf, x, y, ' ', Style::default().bg(rgb(th.bg)));
+                }
+            }
+            // The largest version of the cover is worth having at this size.
+            if let Some(larger) = art::larger(url) {
+                app.want_image(&larger);
+            }
+            app.pixel_jobs.push((cells, url.to_string()));
+            return;
+        }
         let source = app.thumbs.get(url).cloned().unwrap_or(image);
-        Arc::new(art::render_depth(&source, &depth, area.width, area.height, fx))
+        Arc::new(art::render_depth(&source, &depth, area.width, area.height, app.art_fx()))
     } else {
         if mode == ArtMode::Depth && area.width >= 12 {
             // Shown plain until its depth has been worked out.
@@ -234,6 +254,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let th = theme(app);
     app.hits.clear();
     app.art_rects.clear();
+    app.pixel_jobs.clear();
     let buf = f.buffer_mut();
     fill(buf, area, Style::default().bg(rgb(th.bg)).fg(th.text));
 

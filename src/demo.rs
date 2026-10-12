@@ -112,6 +112,11 @@ const LYRICS: &[&str] = &[
     "We're a song on an endless track",
 ];
 
+/// Use `image` as the album cover.
+pub fn set_cover(app: &mut App, image: RgbImage) {
+    app.on_msg(Msg::Image { url: COVER.into(), image: Some(Arc::new(image)) });
+}
+
 pub fn app(cfg: Config) -> App {
     let mut app = App::new(cfg, None, Arc::new(Hub::default()));
     app.demo = true;

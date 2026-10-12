@@ -17,6 +17,7 @@ mod lyrics;
 mod model;
 mod mpris;
 mod out;
+mod pixels;
 mod setup;
 mod spot;
 mod ui;
@@ -86,7 +87,7 @@ fn main() {
                     value("--keys").as_deref().unwrap_or(""),
                     value("--frames").and_then(|n| n.parse().ok()).unwrap_or(40),
                 ),
-                None => run(None).await,
+                None => run(value("--cover"), value("--keys")).await,
             },
             Some("logout") => {
                 setup::logout();
@@ -234,10 +235,19 @@ async fn start(redo_setup: bool, redo_login: bool) -> Result<()> {
     result
 }
 
-/// Run the interface with no backend (demo mode).
-async fn run(_: Option<()>) -> Result<()> {
+/// Run the interface with no backend (demo mode). `--cover picture.jpg` uses
+/// that picture as the album cover, and `--keys` presses keys before handing over.
+async fn run(cover: Option<String>, keys: Option<String>) -> Result<()> {
     let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
-    tui(demo::app(Config::default()), rx).await
+    let _ = init_logging();
+    let mut app = demo::app(Config::default());
+    if let Some(path) = cover {
+        demo::set_cover(&mut app, image::load_from_memory(&std::fs::read(path)?)?.to_rgb8());
+    }
+    for code in typed_keys(keys.as_deref().unwrap_or(""))? {
+        app.on_term(TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+    tui(app, rx).await
 }
 
 static TUI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -246,6 +256,7 @@ static TUI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// for one). Hand the terminal back in a usable state when that happens.
 extern "C" fn on_exit() {
     if TUI_ACTIVE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        pixels::clear();
         let _ = disable_raw_mode();
         let _ = execute!(
             std::io::stdout(),
@@ -278,6 +289,7 @@ fn enter_terminal(mouse: bool) -> Result<Terminal<CrosstermBackend<std::io::Stdo
 
 fn leave_terminal() {
     TUI_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    pixels::clear();
     let _ = disable_raw_mode();
     let _ = execute!(
         std::io::stdout(),
@@ -286,6 +298,36 @@ fn leave_terminal() {
         LeaveAlternateScreen,
         cursor::Show
     );
+}
+
+/// Send this frame's covers that are drawn as real pictures, and take down
+/// any that are no longer wanted. Called once the characters are on screen.
+fn show_pictures(app: &mut App) {
+    /// Pixels drawn per pixel the terminal reports, for screens with more
+    /// than they admit to; and the most on a side, for the time it takes.
+    const DENSITY: f32 = 1.5;
+    const LIMIT: f32 = 512.0;
+    let jobs = std::mem::take(&mut app.pixel_jobs);
+    let Some(mut screen) = app.pixels.take() else { return };
+    let fx = app.art_fx();
+    let mut shown = 0;
+    for (cells, url) in &jobs {
+        let larger = art::larger(url).and_then(|url| app.images.get(&url));
+        let (Some(depth), Some(image)) = (app.depths.get(url), larger.or_else(|| app.images.get(url))) else {
+            continue;
+        };
+        let (wide, tall) = (cells.width as f32 * screen.cell.0 as f32, cells.height as f32 * screen.cell.1 as f32);
+        let scale = DENSITY.min(LIMIT / wide.max(tall));
+        let (w, h) = ((wide * scale) as u32, (tall * scale) as u32);
+        let started = Instant::now();
+        let rgb = art::render_depth_rgb(image, depth, w, h, fx);
+        if screen.show(shown, *cells, w, h, &rgb, started.elapsed()).is_err() {
+            break;
+        }
+        shown += 1;
+    }
+    screen.keep(shown);
+    app.pixels = Some(screen);
 }
 
 async fn tui(mut app: App, mut rx: tokio::sync::mpsc::UnboundedReceiver<Msg>) -> Result<()> {
@@ -303,6 +345,13 @@ async fn tui(mut app: App, mut rx: tokio::sync::mpsc::UnboundedReceiver<Msg>) ->
     }));
 
     let mut terminal = enter_terminal(app.cfg.mouse)?;
+    // Asked before anything else reads the keyboard: the answer arrives as input.
+    if app.cfg.pictures {
+        app.pixels = pixels::detect();
+        if let Some(screen) = &app.pixels {
+            log::info!("pictures: this terminal draws them; a character is {}x{} pixels", screen.cell.0, screen.cell.1);
+        }
+    }
     let mut events = EventStream::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
@@ -315,6 +364,7 @@ async fn tui(mut app: App, mut rx: tokio::sync::mpsc::UnboundedReceiver<Msg>) ->
             if let Err(e) = terminal.draw(|f| ui::draw(f, &mut app)) {
                 break Err(e.into());
             }
+            show_pictures(&mut app);
         }
         // State changes can shorten the interval (playback started), never past due.
         next_tick = next_tick.min(Instant::now() + app.tick_interval());
@@ -1143,25 +1193,7 @@ fn snapshot(size: &str, keys: &str, frames: u32) -> Result<()> {
     app.fixed_step = Some(1.0 / 30.0);
     let mut terminal = Terminal::new(TestBackend::new(w, h))?;
 
-    let mut rest = keys;
-    while !rest.is_empty() {
-        let (code, used) = if let Some(end) = rest.strip_prefix('<').and_then(|r| r.find('>')) {
-            let code = match &rest[1..=end] {
-                "enter" => KeyCode::Enter,
-                "esc" => KeyCode::Esc,
-                "tab" => KeyCode::Tab,
-                "up" => KeyCode::Up,
-                "down" => KeyCode::Down,
-                "left" => KeyCode::Left,
-                "right" => KeyCode::Right,
-                other => return Err(anyhow!("unknown key <{other}>")),
-            };
-            (code, end + 2)
-        } else {
-            let c = rest.chars().next().unwrap();
-            (KeyCode::Char(c), c.len_utf8())
-        };
-        rest = &rest[used..];
+    for code in typed_keys(keys)? {
         app.on_term(TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)));
         // Lay out between keys so scroll positions settle as they would live.
         terminal.draw(|f| ui::draw(f, &mut app))?;
@@ -1188,6 +1220,34 @@ async fn depth_test(path: &str, at: f32, beat: f32) -> Result<()> {
     let started = Instant::now();
     let map = depth::estimate(&cover)?;
     eprintln!("depth worked out in {:.0} ms", started.elapsed().as_secs_f32() * 1000.0);
+    // What a frame of the real-picture version costs to draw, at its largest.
+    let started = Instant::now();
+    let mut bytes = 0;
+    for frame in 0..40 {
+        let fx = art::Fx { beat: (frame % 8) as f32 / 8.0, bass: 0.5, time: frame as f32 * 0.05 };
+        bytes += art::render_depth_rgb(&cover, &map, 432, 432, fx).len();
+    }
+    eprintln!("a 432x432 picture ({} KB) takes {:.1} ms to draw", bytes / 40 / 1024, started.elapsed().as_secs_f32() * 1000.0 / 40.0);
+    {
+        use image::ImageEncoder;
+        let rgb = art::render_depth_rgb(&cover, &map, 432, 432, art::Fx::default());
+        let started = Instant::now();
+        let mut size = 0;
+        for _ in 0..20 {
+            let mut out = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90).encode(&rgb, 432, 432, image::ExtendedColorType::Rgb8)?;
+            size = out.len();
+        }
+        eprintln!("  as a JPEG: {} KB, {:.1} ms to pack", size / 1024, started.elapsed().as_secs_f32() * 1000.0 / 20.0);
+        let started = Instant::now();
+        for _ in 0..20 {
+            let mut out = Vec::new();
+            image::codecs::png::PngEncoder::new_with_quality(&mut out, image::codecs::png::CompressionType::Fast, image::codecs::png::FilterType::Sub)
+                .write_image(&rgb, 432, 432, image::ExtendedColorType::Rgb8)?;
+            size = out.len();
+        }
+        eprintln!("  as a PNG: {} KB, {:.1} ms to pack", size / 1024, started.elapsed().as_secs_f32() * 1000.0 / 20.0);
+    }
 
     let (w, h) = (48u16, 24u16);
     let thumb = image::imageops::resize(&cover, 160, 160, image::imageops::FilterType::Triangle);
@@ -1213,6 +1273,34 @@ async fn depth_test(path: &str, at: f32, beat: f32) -> Result<()> {
     }
     print!("{out}");
     Ok(())
+}
+
+/// The keys spelled out in a `--keys` argument: literal characters plus
+/// `<enter> <esc> <tab> <up> <down> <left> <right>`.
+fn typed_keys(keys: &str) -> Result<Vec<KeyCode>> {
+    let mut codes = Vec::new();
+    let mut rest = keys;
+    while !rest.is_empty() {
+        let (code, used) = if let Some(end) = rest.strip_prefix('<').and_then(|r| r.find('>')) {
+            let code = match &rest[1..=end] {
+                "enter" => KeyCode::Enter,
+                "esc" => KeyCode::Esc,
+                "tab" => KeyCode::Tab,
+                "up" => KeyCode::Up,
+                "down" => KeyCode::Down,
+                "left" => KeyCode::Left,
+                "right" => KeyCode::Right,
+                other => return Err(anyhow!("unknown key <{other}>")),
+            };
+            (code, end + 2)
+        } else {
+            let c = rest.chars().next().unwrap();
+            (KeyCode::Char(c), c.len_utf8())
+        };
+        rest = &rest[used..];
+        codes.push(code);
+    }
+    Ok(codes)
 }
 
 /// Serialise a rendered frame as ANSI text.

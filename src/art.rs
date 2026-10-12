@@ -240,14 +240,51 @@ pub fn render_pulse(img: &RgbImage, w: u16, h: u16, fx: Fx) -> Rendered {
 /// is closest. A square, `SIDE` to a side, row by row.
 pub struct DepthMap {
     pub near: Vec<u8>,
+    /// For each spot, the nearest thing anywhere within `REACH` of it: the
+    /// most that could ever slide across it, so the search for what shows
+    /// there can start from that instead of from the very front.
+    ceiling: Vec<u8>,
 }
 
 impl DepthMap {
-    pub const SIDE: u32 = 126;
+    pub const SIDE: u32 = 252;
+    /// How far anything moves in a real picture, in map cells, and then some.
+    const REACH: usize = 26;
+
+    /// `None` unless `near` is a full map.
+    pub fn new(near: Vec<u8>) -> Option<Self> {
+        let side = Self::SIDE as usize;
+        if near.len() != side * side {
+            return None;
+        }
+        // The largest value in a square around each cell: along the rows, then down the columns.
+        let spread = |from: &[u8], step: usize, line: usize| -> Vec<u8> {
+            let mut out = vec![0u8; from.len()];
+            for start in 0..side {
+                for i in 0..side {
+                    let (lo, hi) = (i.saturating_sub(Self::REACH), (i + Self::REACH).min(side - 1));
+                    out[start * line + i * step] =
+                        (lo..=hi).map(|j| from[start * line + j * step]).max().unwrap_or(0);
+                }
+            }
+            out
+        };
+        let across = spread(&near, 1, side);
+        let ceiling = spread(&across, side, 1);
+        Some(Self { near, ceiling })
+    }
 
     #[cfg_attr(not(feature = "depth"), allow(dead_code))]
     pub fn from_bytes(near: Vec<u8>) -> Option<Self> {
-        (near.len() == (Self::SIDE * Self::SIDE) as usize).then_some(Self { near })
+        Self::new(near)
+    }
+
+    /// The nearest thing anywhere around a point, 0..1.
+    fn ceiling_at(&self, u: f32, v: f32) -> f32 {
+        let side = Self::SIDE as f32;
+        let x = ((u + 0.5) * side).clamp(0.0, side - 1.0) as usize;
+        let y = ((v + 0.5) * side).clamp(0.0, side - 1.0) as usize;
+        self.ceiling[y * Self::SIDE as usize + x] as f32 * (1.0 / 255.0)
     }
 
     /// Nearness, 0..1, at normalised coordinates (the centre is 0,0).
@@ -255,45 +292,59 @@ impl DepthMap {
         let side = Self::SIDE as f32;
         let x = ((u + 0.5) * side - 0.5).clamp(0.0, side - 1.0);
         let y = ((v + 0.5) * side - 0.5).clamp(0.0, side - 1.0);
-        let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+        let (x0, y0) = (x as usize, y as usize);
         let (x1, y1) = ((x0 + 1).min(Self::SIDE as usize - 1), (y0 + 1).min(Self::SIDE as usize - 1));
         let (fx, fy) = (x - x0 as f32, y - y0 as f32);
-        let p = |x: usize, y: usize| self.near[y * Self::SIDE as usize + x] as f32 / 255.0;
-        (p(x0, y0) * (1.0 - fx) + p(x1, y0) * fx) * (1.0 - fy) + (p(x0, y1) * (1.0 - fx) + p(x1, y1) * fx) * fy
+        // Asked millions of times a second for a picture: kept to the bare sums.
+        let p = |x: usize, y: usize| self.near[y * Self::SIDE as usize + x] as f32;
+        let top = p(x0, y0) + (p(x1, y0) - p(x0, y0)) * fx;
+        let bottom = p(x0, y1) + (p(x1, y1) - p(x0, y1)) * fx;
+        (top + (bottom - top) * fy) * (1.0 / 255.0)
     }
 }
 
-/// Draw the cover as half-blocks with depth. The point of view drifts in a
-/// slow loop, further when the bass is heavy, so near things slide across far
-/// ones; on each beat whatever is nearest jumps towards the viewer and
-/// catches the light.
-pub fn render_depth(img: &RgbImage, depth: &DepthMap, w: u16, h: u16, fx: Fx) -> Rendered {
-    let (cw, ch) = (w.max(1) as u32, h.max(1) as u32);
-    let (iw, ih) = (img.width() as f32, img.height() as f32);
-    let lean = 0.045 + 0.03 * fx.bass;
-    let (lean_x, lean_y) = ((fx.time * 0.55).sin() * lean, (fx.time * 0.37).cos() * lean * 0.6);
-    let punch = 0.12 * fx.beat;
-    // Drawn slightly enlarged, so sliding never brings the cover's edge into view.
-    const MARGIN: f32 = 1.07;
+/// The depth style's point of view at one instant. It drifts in a slow loop,
+/// further when the bass is heavy, so near things slide across far ones; on
+/// each beat whatever is nearest jumps towards the viewer and catches the light.
+struct DepthView {
+    lean_x: f32,
+    lean_y: f32,
+    punch: f32,
+    fx: Fx,
+    fine: bool,
+}
 
-    let sample = |u: f32, v: f32| -> [f32; 3] {
-        let x = ((u + 0.5) * iw - 0.5).clamp(0.0, iw - 1.0);
-        let y = ((v + 0.5) * ih - 0.5).clamp(0.0, ih - 1.0);
-        let (x0, y0) = (x.floor() as u32, y.floor() as u32);
-        let (x1, y1) = ((x0 + 1).min(img.width() - 1), (y0 + 1).min(img.height() - 1));
-        let (tx, ty) = (x - x0 as f32, y - y0 as f32);
-        std::array::from_fn(|c| {
-            let p = |x: u32, y: u32| img.get_pixel(x, y).0[c] as f32;
-            (p(x0, y0) * (1.0 - tx) + p(x1, y0) * tx) * (1.0 - ty) + (p(x0, y1) * (1.0 - tx) + p(x1, y1) * tx) * ty
-        })
-    };
-    let pixel = |px: u32, py: u32| -> Rgb {
-        let u = ((px as f32 + 0.5) / cw as f32 - 0.5) / MARGIN;
-        let v = ((py as f32 + 0.5) / (ch * 2) as f32 - 0.5) / MARGIN;
+impl DepthView {
+    /// Drawn slightly enlarged, so sliding rarely brings the cover's edge into view.
+    const MARGIN: f32 = 1.05;
+    /// How near something has to be to stay where it is while the rest
+    /// slides. Set towards the front: what is in front is usually the
+    /// subject, or the title, and should not wander out of the picture.
+    const STILL: f32 = 0.6;
+
+    /// `fine` is for a real picture, where a small movement shows; in
+    /// half-blocks it has to be bigger to be seen at all.
+    fn new(fx: Fx, fine: bool) -> Self {
+        let lean = if fine { 0.028 + 0.02 * fx.bass } else { 0.045 + 0.03 * fx.bass };
+        Self {
+            lean_x: (fx.time * 0.55).sin() * lean,
+            lean_y: (fx.time * 0.37).cos() * lean * 0.6,
+            punch: 0.13 * fx.beat,
+            fx,
+            fine,
+        }
+    }
+
+    /// What shows at a point of the picture (the centre is 0,0 and the edges
+    /// are at half): where on the cover it comes from, and how brightly lit.
+    fn see(&self, depth: &DepthMap, u: f32, v: f32) -> (f32, f32, f32) {
+        let (u, v) = (u / Self::MARGIN, v / Self::MARGIN);
         // Where on the cover a point this near would have been brought here from.
         let from = |near: f32| {
-            let grow = 1.0 + punch * near;
-            ((u + lean_x * (near - 0.5) * 2.0) / grow, (v + lean_y * (near - 0.5) * 2.0) / grow)
+            let slide = (near - Self::STILL) * 2.0;
+            // On the beat the front comes forward and the back falls away.
+            let grow = 1.0 + self.punch * (near - 0.4);
+            ((u + self.lean_x * slide) / grow, (v + self.lean_y * slide) / grow)
         };
         // Step back from the nearest layer until the cover turns out to be at
         // least that near: that is the surface seen here, in front of
@@ -304,18 +355,24 @@ pub fn render_depth(img: &RgbImage, depth: &DepthMap, w: u16, h: u16, fx: Fx) ->
         // side of something, met edge-on across the gap it left when it slid.
         const EDGE_ON: f32 = 0.15;
         let (mut su, mut sv, mut near) = (u, v, 0.0);
-        let behind = from(1.0);
+        // The last two places looked at that turned out to be open air.
+        let mut trail = [(u, v); 2];
         let mut before: Option<(f32, f32)> = None;
-        for layer in 0..=LAYERS {
+        // Nothing nearer than this is close enough to slide over this spot,
+        // so the layers in front of it needn't be looked through. (Only where
+        // the movement is small enough for the map's reach, and where there
+        // are enough pixels for the saving to matter.)
+        let first = if self.fine { ((1.0 - depth.ceiling_at(u, v)) * LAYERS as f32) as usize } else { 0 };
+        for layer in first..=LAYERS {
             let guess = 1.0 - layer as f32 / LAYERS as f32;
             let (gu, gv) = from(guess);
             let short = guess - depth.at(gu, gv);
             if short <= 0.0 {
                 match before {
-                    // The gap shows what is behind it, taken from well clear
-                    // of its edge, not the thing itself stretched to cover it.
+                    // The gap shows what is behind it, from just clear of the
+                    // edge, not the thing itself stretched to cover it.
                     Some((last, was_short)) if (guess - short) - (last - was_short) > EDGE_ON => {
-                        (su, sv) = behind;
+                        (su, sv) = trail[0];
                         near = depth.at(su, sv);
                     }
                     // Between the last layer and this one; settle where they cross.
@@ -328,15 +385,48 @@ pub fn render_depth(img: &RgbImage, depth: &DepthMap, w: u16, h: u16, fx: Fx) ->
                 break;
             }
             before = Some((guess, short));
+            trail = [if layer == first { (gu, gv) } else { trail[1] }, (gu, gv)];
             (su, sv, near) = (gu, gv, guess);
         }
         // The far distance sits back a little; the beat lights what is close.
-        let gain = 0.84 + 0.16 * near + fx.beat * 0.28 * near * near + 0.06 * fx.bass;
-        let colour = sample(su, sv);
-        let tone = |value: f32| (value * gain).clamp(0.0, 255.0) as u8;
-        (tone(colour[0]), tone(colour[1]), tone(colour[2]))
-    };
+        let gain = 0.84 + 0.16 * near + self.fx.beat * 0.28 * near * near + 0.06 * self.fx.bass;
+        (su, sv, gain)
+    }
 
+    /// The colour of the picture at a point, read off `img`.
+    fn colour(&self, img: &RgbImage, depth: &DepthMap, u: f32, v: f32) -> Rgb {
+        let (su, sv, gain) = self.see(depth, u, v);
+        Self::read(img, su, sv, gain)
+    }
+
+    /// The cover's colour at a point of it, lit by `gain`.
+    fn read(img: &RgbImage, su: f32, sv: f32, gain: f32) -> Rgb {
+        let (iw, ih) = (img.width() as f32, img.height() as f32);
+        // Past the edge of the cover, carry on with its mirror image: a
+        // background continues, where repeating the last pixel would streak.
+        let fold = |t: f32| if t < -0.5 { -1.0 - t } else if t > 0.5 { 1.0 - t } else { t };
+        let x = ((fold(su) + 0.5) * iw - 0.5).clamp(0.0, iw - 1.0);
+        let y = ((fold(sv) + 0.5) * ih - 0.5).clamp(0.0, ih - 1.0);
+        let (x0, y0) = (x.floor() as u32, y.floor() as u32);
+        let (x1, y1) = ((x0 + 1).min(img.width() - 1), (y0 + 1).min(img.height() - 1));
+        let (tx, ty) = (x - x0 as f32, y - y0 as f32);
+        let (a, b, c, d) = (img.get_pixel(x0, y0).0, img.get_pixel(x1, y0).0, img.get_pixel(x0, y1).0, img.get_pixel(x1, y1).0);
+        let tone = |i: usize| {
+            let top = a[i] as f32 * (1.0 - tx) + b[i] as f32 * tx;
+            let bottom = c[i] as f32 * (1.0 - tx) + d[i] as f32 * tx;
+            ((top * (1.0 - ty) + bottom * ty) * gain).clamp(0.0, 255.0) as u8
+        };
+        (tone(0), tone(1), tone(2))
+    }
+}
+
+/// Draw the cover with depth as half-blocks: two pixels to a character.
+pub fn render_depth(img: &RgbImage, depth: &DepthMap, w: u16, h: u16, fx: Fx) -> Rendered {
+    let (cw, ch) = (w.max(1) as u32, h.max(1) as u32);
+    let view = DepthView::new(fx, false);
+    let pixel = |px: u32, py: u32| {
+        view.colour(img, depth, (px as f32 + 0.5) / cw as f32 - 0.5, (py as f32 + 0.5) / (ch * 2) as f32 - 0.5)
+    };
     let mut cells = Vec::with_capacity((cw * ch) as usize);
     for y in 0..ch {
         for x in 0..cw {
@@ -344,6 +434,75 @@ pub fn render_depth(img: &RgbImage, depth: &DepthMap, w: u16, h: u16, fx: Fx) ->
         }
     }
     Rendered { w, h, cells }
+}
+
+/// Run `work` on every row of `rows`, shared out between a few threads. The
+/// rows are dealt out in turn rather than in blocks, because some parts of a
+/// picture take far longer than others and a block of those would hold
+/// everything up.
+fn share_rows<T: Send>(rows: Vec<&mut [T]>, work: impl Fn(usize, &mut [T]) + Sync) {
+    let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 6);
+    let mut hands: Vec<Vec<(usize, &mut [T])>> = (0..threads).map(|_| Vec::new()).collect();
+    for (n, row) in rows.into_iter().enumerate() {
+        hands[n % threads].push((n, row));
+    }
+    std::thread::scope(|scope| {
+        for hand in hands {
+            let work = &work;
+            scope.spawn(move || {
+                for (n, row) in hand {
+                    work(n, row);
+                }
+            });
+        }
+    });
+}
+
+/// Draw the cover with depth as a real picture, `w` by `h` pixels of RGB, for
+/// terminals that can show one. This is thousands of times the pixels of the
+/// half-block version, so two things keep it quick: the rows are shared out
+/// between threads, and where each point comes from on the cover (the slow
+/// part) is worked out for every other pixel each way and filled in between.
+/// The colours themselves are read for every pixel, so nothing gets blurred.
+pub fn render_depth_rgb(img: &RgbImage, depth: &DepthMap, w: u32, h: u32, fx: Fx) -> Vec<u8> {
+    const EVERY: usize = 2;
+    let (w, h) = (w.max(1) as usize, h.max(1) as usize);
+    let view = DepthView::new(fx, true);
+
+    // Where from, and how lit, on a grid: one more point than needed each
+    // way, so every pixel sits between four of them.
+    let (gw, gh) = ((w - 1) / EVERY + 2, (h - 1) / EVERY + 2);
+    let mut grid = vec![(0f32, 0f32, 0f32); gw * gh];
+    share_rows(grid.chunks_mut(gw).collect(), |gy, row| {
+        let v = ((gy * EVERY) as f32 + 0.5) / h as f32 - 0.5;
+        for (gx, point) in row.iter_mut().enumerate() {
+            *point = view.see(depth, ((gx * EVERY) as f32 + 0.5) / w as f32 - 0.5, v);
+        }
+    });
+
+    let mut out = vec![0u8; w * h * 3];
+    let grid = &grid;
+    share_rows(out.chunks_mut(w * 3).collect(), |y, row| {
+        let (gy, ty) = (y / EVERY, (y % EVERY) as f32 / EVERY as f32);
+        for (x, pixel) in row.chunks_exact_mut(3).enumerate() {
+            let (gx, tx) = (x / EVERY, (x % EVERY) as f32 / EVERY as f32);
+            let (a, b) = (grid[gy * gw + gx], grid[gy * gw + gx + 1]);
+            let (c, d) = (grid[(gy + 1) * gw + gx], grid[(gy + 1) * gw + gx + 1]);
+            let mix = |a: f32, b: f32, c: f32, d: f32| {
+                let (top, bottom) = (a + (b - a) * tx, c + (d - c) * tx);
+                top + (bottom - top) * ty
+            };
+            let rgb = DepthView::read(img, mix(a.0, b.0, c.0, d.0), mix(a.1, b.1, c.1, d.1), mix(a.2, b.2, c.2, d.2));
+            pixel.copy_from_slice(&[rgb.0, rgb.1, rgb.2]);
+        }
+    });
+    out
+}
+
+/// Spotify serves each cover in a few sizes, named in the address. Given the
+/// one riff normally loads (300 pixels), the address of the largest (640).
+pub fn larger(url: &str) -> Option<String> {
+    url.contains("ab67616d00001e02").then(|| url.replace("ab67616d00001e02", "ab67616d0000b273"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -493,7 +652,7 @@ mod tests {
         let cover = RgbImage::from_fn(96, 96, |x, y| image::Rgb(if inside(x, y, 96) { [250, 250, 250] } else { [10, 10, 10] }));
         let side = DepthMap::SIDE;
         let near = (0..side * side).map(|i| if inside(i % side, i / side, side) { 255 } else { 0 }).collect();
-        (cover, DepthMap { near })
+        (cover, DepthMap::new(near).unwrap())
     }
 
     /// Columns of row `row` of cells that are fully lit.
@@ -525,6 +684,25 @@ mod tests {
         assert!(lit(&hit, 16).len() > lit(&still, 16).len(), "the square didn't grow on the beat");
         // The far background doesn't flash with it.
         assert!(hit.cells[0].fg.0 < 40);
+    }
+
+    #[test]
+    fn the_picture_is_whole_however_the_rows_are_shared_out() {
+        // A height that doesn't divide evenly between the threads drawing it.
+        let (cover, depth) = square_in_front();
+        let fx = Fx { time: 2.0, beat: 0.5, bass: 0.3 };
+        let (w, h) = (40usize, 37usize);
+        let picture = render_depth_rgb(&cover, &depth, w as u32, h as u32, fx);
+        assert_eq!(picture.len(), w * h * 3);
+        // Every other pixel each way is worked out in full; check those.
+        let view = DepthView::new(fx, true);
+        for y in (0..h).step_by(2) {
+            for x in (0..w).step_by(2) {
+                let want = view.colour(&cover, &depth, (x as f32 + 0.5) / w as f32 - 0.5, (y as f32 + 0.5) / h as f32 - 0.5);
+                let got = &picture[(y * w + x) * 3..][..3];
+                assert_eq!((got[0], got[1], got[2]), want, "at {x},{y}");
+            }
+        }
     }
 
     #[test]

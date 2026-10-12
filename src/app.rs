@@ -237,6 +237,10 @@ pub struct App {
     depth_pending: HashSet<String>,
     depth_failed: HashMap<String, Instant>,
     pub art_mode: ArtMode,
+    /// The terminal's way of showing real pictures, when it has one, and the
+    /// covers to be shown that way this frame: which cells, which cover.
+    pub pixels: Option<crate::pixels::Screen>,
+    pub pixel_jobs: Vec<(Rect, String)>,
     pub art_cache: HashMap<(String, u16, u16, ArtMode), Arc<Rendered>>,
     pub palette: Palette,
     palette_target: Palette,
@@ -358,6 +362,8 @@ impl App {
             depth_pending: HashSet::new(),
             depth_failed: HashMap::new(),
             art_mode,
+            pixels: None,
+            pixel_jobs: Vec::new(),
             art_cache: HashMap::new(),
             palette: Palette::default(),
             palette_target: Palette::default(),
@@ -472,6 +478,10 @@ impl App {
         } else if self.party && sounding {
             // Party mode repaints the whole screen; 25 frames a second is plenty.
             Duration::from_millis(40)
+        } else if sounding && self.art_mode == ArtMode::Depth && self.pixels.is_some() {
+            // A picture is far more for the terminal to take in than a screen
+            // of characters, and the drift is slow: sixteen a second is smooth.
+            Duration::from_millis(60)
         } else if animating || (sounding && reactive) {
             Duration::from_millis(33)
         } else if self.pending_seek.is_some() || self.pending_volume.is_some() {
@@ -1445,12 +1455,37 @@ impl App {
         }
     }
 
+    /// How hard the music is hitting right now, for covers that move with it.
+    /// Snapped to steps, so a quiet passage settles into a still image
+    /// instead of repainting imperceptible changes.
+    pub fn art_fx(&self) -> crate::art::Fx {
+        crate::art::Fx {
+            beat: (self.beat * 24.0).round() / 24.0,
+            bass: (self.bass * 10.0).round() / 10.0,
+            time: self.clock,
+        }
+    }
+
     /// Ask for a cover's depth to be worked out, once its picture is here.
     pub fn want_depth(&mut self, url: &str) {
         if self.depths.contains_key(url) || self.depth_pending.contains(url) {
             return;
         }
         if self.depth_failed.get(url).is_some_and(|at| at.elapsed() < Duration::from_secs(300)) {
+            return;
+        }
+        // Demo mode has no backend to hand the work to, and one cover to do.
+        #[cfg(feature = "depth")]
+        if self.demo {
+            let Some(image) = self.images.get(url) else { return };
+            match crate::depth::model_path().exists().then(|| crate::depth::estimate(image)) {
+                Some(Ok(map)) => {
+                    self.depths.insert(url.to_string(), Arc::new(map));
+                }
+                _ => {
+                    self.depth_failed.insert(url.to_string(), Instant::now());
+                }
+            }
             return;
         }
         if let (Some(be), Some(image)) = (&self.backend, self.images.get(url)) {
@@ -1988,6 +2023,10 @@ impl App {
             TermEvent::Mouse(m) => self.on_mouse(m),
             TermEvent::Resize(..) => {
                 self.art_cache.clear();
+                // A different window, or a different font size in it.
+                if self.pixels.as_mut().is_some_and(|screen| !screen.measure()) {
+                    self.pixels = None;
+                }
                 self.dirty = true;
             }
             TermEvent::Paste(text) => {

@@ -113,6 +113,9 @@ riff listens to what it is playing and finds the beat.
   cover is, then lets the foreground and the background drift apart as if you
   were moving your head. Whatever is nearest jumps forward on the beat. This
   style is optional (see Build) and fetches a 27 MB model the first time.
+  In a terminal that can show pictures (kitty, Konsole, Ghostty, WezTerm) it
+  is drawn as one, at the screen's own resolution, instead of in half-blocks;
+  `pictures = false` in the config keeps it to half-blocks.
 - `z` for **party mode**: the whole interface joins in. A spectrum closes in
   from every edge, colours wheel and jump on the beat, and the text sways. `z`
   again to calm it down.

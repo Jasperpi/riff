@@ -84,8 +84,8 @@ pub fn estimate(cover: &RgbImage) -> Result<DepthMap> {
     let span = (near - far).max(1e-6);
     let bytes: Vec<u8> = depth.iter().map(|v| ((v - far) / span * 255.0) as u8).collect();
     let full = GrayImage::from_raw(LOOK, LOOK, bytes).ok_or_else(|| anyhow!("depth model: bad map"))?;
-    // Halved: plenty for a cover drawn in character cells, and the averaging
-    // softens the edges so things slide past each other without tearing.
+    // Kept at the size the network worked at: drawn as a real picture, a
+    // coarser map shows as steps along the edge of anything that moves.
     let kept = image::imageops::resize(&full, DepthMap::SIDE, DepthMap::SIDE, FilterType::Triangle);
-    Ok(DepthMap { near: kept.into_raw() })
+    DepthMap::new(kept.into_raw()).ok_or_else(|| anyhow!("depth model: bad map"))
 }

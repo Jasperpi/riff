@@ -24,6 +24,10 @@ pub struct Config {
     pub dynamic_color: bool,
     pub visualizer: bool,
     pub mouse: bool,
+    /// Draw the depth cover as a real picture in terminals that can show
+    /// one (kitty, Konsole, Ghostty, WezTerm); otherwise, and when this is
+    /// off, it is drawn in half-blocks like the rest.
+    pub pictures: bool,
     /// Blend the end of each song into the start of the next.
     pub mix: bool,
     /// Length of that blend, 1-12.
@@ -44,6 +48,7 @@ impl Default for Config {
             dynamic_color: true,
             visualizer: true,
             mouse: true,
+            pictures: true,
             mix: false,
             mix_seconds: 6,
         }
