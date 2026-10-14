@@ -18,6 +18,8 @@ mod model;
 mod mpris;
 mod out;
 mod pixels;
+mod pop;
+mod quad;
 mod setup;
 mod spot;
 mod ui;

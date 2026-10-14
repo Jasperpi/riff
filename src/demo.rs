@@ -47,6 +47,100 @@ fn cover() -> RgbImage {
     })
 }
 
+/// The other albums' covers, each drawn its own way so the squares and the
+/// lists have some variety to them.
+fn album_cover(album: &str) -> Option<RgbImage> {
+    let lerp = |a: [f32; 3], b: [f32; 3], t: f32| -> [f32; 3] {
+        std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t.clamp(0.0, 1.0))
+    };
+    let paint = |f: &dyn Fn(f32, f32) -> [f32; 3]| {
+        RgbImage::from_fn(300, 300, |x, y| {
+            let c = f(x as f32 / 300.0, y as f32 / 300.0);
+            Rgb([c[0] as u8, c[1] as u8, c[2] as u8])
+        })
+    };
+    Some(match album {
+        // A wave curling over under a low sun.
+        "Tidal" => paint(&|x, y| {
+            let mut c = lerp([255.0, 196.0, 120.0], [255.0, 120.0, 90.0], y * 1.6);
+            let (dx, dy) = (x - 0.72, y - 0.3);
+            if (dx * dx + dy * dy).sqrt() < 0.11 {
+                c = [255.0, 244.0, 200.0];
+            }
+            for (k, colour) in [[20.0, 70.0, 130.0], [10.0, 120.0, 170.0], [60.0, 190.0, 210.0]].iter().enumerate() {
+                let crest = 0.48 + k as f32 * 0.12 + (x * 9.0 + k as f32 * 2.0).sin() * 0.05;
+                if y > crest {
+                    c = *colour;
+                    if y < crest + 0.02 {
+                        c = [240.0, 250.0, 255.0];
+                    }
+                }
+            }
+            c
+        }),
+        // Squares inside squares, in muted paint.
+        "Small Rooms" => paint(&|x, y| {
+            let d = (x - 0.5).abs().max((y - 0.56).abs());
+            match (d * 8.0) as u32 {
+                0 => [236.0, 196.0, 92.0],
+                1 => [214.0, 120.0, 72.0],
+                2 => [150.0, 64.0, 70.0],
+                3 => [70.0, 44.0, 70.0],
+                _ => [34.0, 30.0, 44.0],
+            }
+        }),
+        // A station roundel on tiles.
+        "Platform Nine" => paint(&|x, y| {
+            let (dx, dy) = (x - 0.5, y - 0.5);
+            let r = (dx * dx + dy * dy).sqrt();
+            let tile = ((x * 12.0).fract() < 0.06 || (y * 24.0).fract() < 0.06) as u8 as f32;
+            let mut c = lerp([238.0, 236.0, 226.0], [180.0, 178.0, 170.0], tile);
+            if (0.22..0.33).contains(&r) {
+                c = [220.0, 36.0, 48.0];
+            }
+            if dy.abs() < 0.05 && dx.abs() < 0.38 {
+                c = [24.0, 48.0, 140.0];
+            }
+            c
+        }),
+        // Seventies stripes sweeping across cream.
+        "Polaroids" => paint(&|x, y| {
+            let band = ((x + y * 0.6) * 7.0) as i32;
+            match band {
+                3 => [232.0, 72.0, 52.0],
+                4 => [246.0, 146.0, 44.0],
+                5 => [250.0, 204.0, 64.0],
+                6 => [74.0, 160.0, 120.0],
+                _ => [244.0, 232.0, 206.0],
+            }
+        }),
+        // Pines black against a big orange moon.
+        "Hollow Pines" => paint(&|x, y| {
+            let mut c = lerp([30.0, 22.0, 60.0], [120.0, 60.0, 90.0], y);
+            let (dx, dy) = (x - 0.5, y - 0.42);
+            if (dx * dx + dy * dy).sqrt() < 0.24 {
+                c = [250.0, 150.0, 60.0];
+            }
+            for k in 0..6 {
+                let base = k as f32 / 5.0;
+                let height = 0.35 + (k * 37 % 5) as f32 * 0.06;
+                if y > 1.0 - height && (x - base).abs() < (y - (1.0 - height)) * 0.35 {
+                    c = [12.0, 24.0, 20.0];
+                }
+            }
+            c
+        }),
+        _ => return None,
+    })
+}
+
+fn album_url(album: &str) -> String {
+    match album_cover(album) {
+        Some(_) => format!("demo://{}", album.to_lowercase().replace(' ', "-")),
+        None => COVER.into(),
+    }
+}
+
 fn track(n: usize, name: &str, artist: &str, album: &str, secs: u32) -> Track {
     Track {
         uri: format!("spotify:track:demo{n:018}"),
@@ -57,7 +151,7 @@ fn track(n: usize, name: &str, artist: &str, album: &str, secs: u32) -> Track {
         album_id: format!("album{n}"),
         duration_ms: secs * 1000,
         explicit: false,
-        image: Some(COVER.into()),
+        image: Some(album_url(album)),
         added_at: None,
         playable: true,
     }
@@ -121,6 +215,9 @@ pub fn app(cfg: Config) -> App {
     let mut app = App::new(cfg, None, Arc::new(Hub::default()));
     app.demo = true;
     app.on_msg(Msg::Image { url: COVER.into(), image: Some(Arc::new(cover())) });
+    for album in ["Tidal", "Small Rooms", "Platform Nine", "Polaroids", "Hollow Pines"] {
+        app.on_msg(Msg::Image { url: album_url(album), image: album_cover(album).map(Arc::new) });
+    }
 
     let playlists = [
         ("Late Night Coding", 84, 0),
