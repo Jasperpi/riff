@@ -274,6 +274,8 @@ pub struct App {
     pub fixed_step: Option<f32>,
     /// The whole interface dances to the music.
     pub party: bool,
+    /// Which scene party mode is showing, and whether the music just dropped.
+    pub rave: crate::party::Rave,
 
     /// Songs marked with x / ctrl-click. Kept across pages and searches so a
     /// queue can be assembled from anywhere.
@@ -400,6 +402,7 @@ impl App {
             last_tick: Instant::now(),
             fixed_step: None,
             party: false,
+            rave: Default::default(),
             basket: Vec::new(),
             queued: VecDeque::new(),
             range: None,
@@ -1543,7 +1546,6 @@ impl App {
                 bpm: Some(120.0),
                 phase: Some(beat),
                 bar: Some(bar),
-                level: if sq.playing { 0.5 + 0.3 * (1.0 - beat) } else { 0.0 },
                 heard: heard[d],
                 sync: Sync::Locked,
             };
@@ -2301,6 +2303,14 @@ impl App {
         }
         let treble = live.map_or(0.0, |s| s.bands[BANDS * 2 / 3..].iter().sum::<f32>() / (BANDS / 3) as f32);
         self.highs += (treble - self.highs) * (dt * 8.0).min(1.0);
+        if self.party {
+            let level = live.map_or(0.0, |s| s.bands.iter().sum::<f32>() / BANDS as f32);
+            let scene = self.rave.scene;
+            self.rave.tick(dt, level, live.is_some_and(|s| s.beat), self.beats);
+            if self.rave.scene != scene && self.rave.drop > 0.9 {
+                self.dirty = true;
+            }
+        }
         let bass = live.map(|s| s.bass).unwrap_or(0.0);
         self.bass += (bass - self.bass) * (dt * 10.0).min(1.0);
         self.clock += dt * (0.6 + self.bass);

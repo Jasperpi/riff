@@ -31,6 +31,7 @@ Press `?` inside riff for every key. The short version:
 | `v` | now playing: big cover, lyrics, spectrum |
 | `c` | cover style: blocks, ascii, braille, pulse, depth |
 | `D` | DJ decks: two songs at once, with a crossfader |
+| `4` | four squares: four songs at once, arrows to switch |
 | `m` `M` | crossfade between songs, change its length |
 | `z` | party mode |
 | `d` `u` | devices, up next |
@@ -97,6 +98,44 @@ matching works best on music with a steady pulse; a band with a live drummer
 wanders, and riff follows it as well as it can. The decks are local to riff:
 other Spotify devices won't show what they are playing.
 
+### Four squares
+
+`4` and four songs start at once, one in each quarter of the screen, each
+printed like a pop-art poster in its own loud colours. You hear one of
+them. The arrow keys pick another, and riff brings it in when the music
+says so, not the instant you press:
+
+- All four play the whole time. The three you can't hear run underneath
+  the one you can, bent to its tempo and slid onto its beats, and onto its
+  bars where riff can tell which beat is the one. So whichever you pick is
+  already in time.
+- The switch lands on the next bar. How it goes over depends on how long
+  you stayed: after a while, a blend over a bar with the bass lines
+  swapping half-way; sooner, the old song's last beat stutters into the new
+  one; flick between squares and it chops between them on the beat. A song
+  too far apart in tempo to match is swept in instead.
+- The square coming in shows **NEXT** and a dot for each beat to go.
+
+| | |
+|---|---|
+| `←` `→` `↑` `↓` | the next song (click a square too) |
+| shift+arrow | drop it: stutter, then in on the one |
+| `enter` | stutter the song playing for a beat |
+| `tab` | a square chosen for you |
+| `n` `p` | round the squares |
+| `space` | pause all four, together |
+| `esc` | back to your songs, squares still playing |
+| `4` | squares off |
+
+The squares start with what's playing, then songs you marked with `x`,
+then the list you're in from the cursor down. When a song in a quiet
+square finishes, the next one from that list takes its place; a square
+near the end of its song hands over by itself. Back in your songs,
+`enter` puts the song under the cursor into a square.
+
+The squares, like the decks, are local to riff, and they take over from
+the decks (and the decks from them).
+
 ### Crossfade
 
 Outside the decks, `m` blends the end of each song into the start of the next
@@ -110,15 +149,29 @@ riff listens to what it is playing and finds the beat.
 - `c` until the cover style says **pulse**: the album cover punches in,
   brightens and ripples on each beat.
 - `c` once more for **depth**: riff works out how near each part of the
-  cover is, then lets the foreground and the background drift apart as if you
-  were moving your head. Whatever is nearest jumps forward on the beat. This
-  style is optional (see Build) and fetches a 27 MB model the first time.
+  cover is and turns it into a scene with a camera moving through it. The
+  foreground and background drift apart as if you were moving your head,
+  and on every bar the camera swings round to a new viewpoint; over eight
+  bars it dollies in and out, keeping the subject's size while the
+  background breathes behind it. A coloured light circles the scene and
+  falls on it by the way each surface faces, catching the edges on the
+  beat. The focus rests on the subject, with the distance soft and hazy,
+  and pulls back to the distance at the end of each phrase. On each
+  downbeat a line of light sweeps through from front to back, and dust
+  drifts at every depth, passing in front of and behind things. Whatever is
+  nearest jumps forward on the beat. This style is optional (see Build)
+  and fetches a 27 MB model the first time.
   In a terminal that can show pictures (kitty, Konsole, Ghostty, WezTerm) it
   is drawn as one, at the screen's own resolution, instead of in half-blocks;
   `pictures = false` in the config keeps it to half-blocks.
-- `z` for **party mode**: the whole interface joins in. A spectrum closes in
-  from every edge, colours wheel and jump on the beat, and the text sways. `z`
-  again to calm it down.
+- `z` for **party mode**: the whole interface joins in. Behind it all runs a
+  scene that changes every four bars: the spectrum closing in from every
+  edge, a tunnel of rings leaping outward on the beat, a slow plasma, laser
+  beams sweeping up from the floor, rain of glyphs falling at the pace of
+  their part of the spectrum, stars streaking past. Colours wheel and jump
+  on the beat, the text sways, and covers get a frame of light. When the
+  music drops back in after a breakdown, the screen flashes once, shakes,
+  glitches, and jumps to a hotter scene. `z` again to calm it down.
 
 ## Why it doesn't stall
 

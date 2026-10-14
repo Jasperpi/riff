@@ -544,11 +544,6 @@ impl Eq {
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
-
-    /// How loud the lows, mids and highs are coming out, 0..1.
-    pub(crate) fn levels(&self) -> [f32; 3] {
-        self.level
-    }
 }
 
 // ---- shared state -----------------------------------------------------------

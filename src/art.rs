@@ -712,9 +712,9 @@ pub fn render_depth(img: &RgbImage, depth: &DepthMap, w: u16, h: u16, fx: Fx) ->
 /// rows are dealt out in turn rather than in blocks, because some parts of a
 /// picture take far longer than others and a block of those would hold
 /// everything up.
-fn share_rows<T: Send>(rows: Vec<&mut [T]>, work: impl Fn(usize, &mut [T]) + Sync) {
+fn share_rows<R: Send>(rows: Vec<R>, work: impl Fn(usize, R) + Sync) {
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 6);
-    let mut hands: Vec<Vec<(usize, &mut [T])>> = (0..threads).map(|_| Vec::new()).collect();
+    let mut hands: Vec<Vec<(usize, R)>> = (0..threads).map(|_| Vec::new()).collect();
     for (n, row) in rows.into_iter().enumerate() {
         hands[n % threads].push((n, row));
     }
@@ -763,7 +763,8 @@ fn draw_depth(img: &RgbImage, depth: &DepthMap, w: usize, h: usize, fx: Fx, fine
     let mut nearness = vec![0f32; w * h];
     let grid = &grid;
     let rows: Vec<(&mut [u8], &mut [f32])> = out.chunks_mut(w * 3).zip(nearness.chunks_mut(w)).collect();
-    share_pairs(rows, |y, (row, near_row)| {
+    // A row of colour goes with its row of nearness, for the motes.
+    share_rows(rows, |y, (row, near_row): (&mut [u8], &mut [f32])| {
         let (gy, ty) = (y / every, (y % every) as f32 / every as f32);
         for (x, pixel) in row.chunks_exact_mut(3).enumerate() {
             let (gx, tx) = (x / every, (x % every) as f32 / every as f32);
@@ -787,25 +788,6 @@ fn draw_depth(img: &RgbImage, depth: &DepthMap, w: usize, h: usize, fx: Fx, fine
     });
     view.motes(&mut out, &nearness, w, h);
     out
-}
-
-/// `share_rows` for rows that come in pairs: a row of colour and its row of nearness.
-fn share_pairs(rows: Vec<(&mut [u8], &mut [f32])>, work: impl Fn(usize, (&mut [u8], &mut [f32])) + Sync) {
-    let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 6);
-    let mut hands: Vec<Vec<(usize, (&mut [u8], &mut [f32]))>> = (0..threads).map(|_| Vec::new()).collect();
-    for (n, row) in rows.into_iter().enumerate() {
-        hands[n % threads].push((n, row));
-    }
-    std::thread::scope(|scope| {
-        for hand in hands {
-            let work = &work;
-            scope.spawn(move || {
-                for (n, row) in hand {
-                    work(n, row);
-                }
-            });
-        }
-    });
 }
 
 /// Spotify serves each cover in a few sizes, named in the address. Given the

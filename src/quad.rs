@@ -260,7 +260,6 @@ pub struct Meter {
     pub phase: Option<f32>,
     /// 0..1 through the current bar, when the bar is known.
     pub bar: Option<f32>,
-    pub level: f32,
     /// How much of it is being heard, 0..1.
     pub heard: f32,
     pub sync: Sync,
@@ -302,8 +301,6 @@ pub struct SquareView {
     pub ended: bool,
     pub failed: bool,
     pub pos_ms: u32,
-    /// Tempo change from the song's own, e.g. 0.03 for +3%.
-    pub bend: f32,
     pub meter: Meter,
 }
 
@@ -379,10 +376,6 @@ impl Quad {
         Ok(())
     }
 
-    pub fn is_loaded(&self, square: usize) -> bool {
-        self.tracks[square].is_some()
-    }
-
     fn request(&self, r: Request) {
         self.shared.requests.lock().unwrap().push(r);
         self.shared.wake.1.notify_all();
@@ -443,7 +436,6 @@ impl Quad {
                 ended,
                 failed,
                 pos_ms: deck.heard_ms(),
-                bend: load_f32(&deck.rate) - 1.0,
                 meter: info.meters[d],
             };
         }
@@ -591,7 +583,7 @@ impl Mixer {
             self.follow[d] = if was_locked && (d == from || matches!(self.follow[d], Follow::Locked(_))) {
                 // Already on the same grid as the new leader, through the old
                 // one: held there from the tempo each runs at now.
-                Follow::Locked(Lock::new(d, load_f32(&shared.decks[d].rate), self.decks[d].tempo.now))
+                Follow::Locked(Lock::new(d, load_f32(&shared.decks[d].rate), frames_at(&self.decks[d].tempo)))
             } else {
                 Follow::Listening
             };
@@ -603,9 +595,10 @@ impl Mixer {
     fn follow(&mut self, shared: &Shared) {
         let live = self.live;
         let now = self.now();
-        let moving = match self.phase {
-            Phase::Moving { from, to, .. } => Some((from, to)),
-            _ => None,
+        // The square coming in: heard, or about to be.
+        let coming = match self.phase {
+            Phase::Moving { to, .. } | Phase::Waiting { to, .. } => Some(to),
+            Phase::Steady => None,
         };
         for d in 0..SQUARES {
             if d == live || !shared.decks[d].playing.load(Ordering::Relaxed) {
@@ -615,18 +608,19 @@ impl Mixer {
                 self.seen[d] = self.decks[d].generation;
                 self.follow[d] = Follow::Listening;
             }
-            // While it is being brought in it is heard: leave it be.
-            if moving.is_some_and(|(_, to)| to == d) {
-                continue;
-            }
             let rate = &shared.decks[d].rate;
             match &mut self.follow[d] {
+                // While it is being brought in it is heard: leave it be.
+                Follow::Locked(_) if coming == Some(d) && matches!(self.phase, Phase::Moving { .. }) => {}
                 Follow::Locked(lock) => {
                     let (lead, follow) = pair(&mut self.decks, live, d);
-                    lock.steer(&lead.tempo, &follow.tempo, rate, follow.tempo.now);
+                    lock.steer(&lead.tempo, &follow.tempo, rate, frames_at(&follow.tempo));
                 }
                 Follow::Apart { retry_at } if now >= *retry_at => self.follow[d] = Follow::Listening,
                 Follow::Apart { .. } => {}
+                // Matching may hold it back as much as a bar: never just
+                // before it is to be heard.
+                Follow::Listening if coming == Some(d) => {}
                 Follow::Listening => {
                     let lead = &self.decks[live].tempo;
                     let follow = &self.decks[d].tempo;
@@ -637,7 +631,7 @@ impl Mixer {
                     }
                     let (lead, follow) = pair(&mut self.decks, live, d);
                     self.follow[d] = match beatmatch(rate, &lead.tempo, follow, true) {
-                        Ok(_) => Follow::Locked(Lock::new(d, load_f32(rate), follow.tempo.now)),
+                        Ok(_) => Follow::Locked(Lock::new(d, load_f32(rate), frames_at(&follow.tempo))),
                         Err(e) => {
                             log::info!("square {}: {e}", square_name(d));
                             // Ten seconds on, the song may have moved somewhere that matches.
@@ -852,6 +846,12 @@ fn mixer_loop(shared: Arc<Shared>, volume: Box<dyn VolumeGetter + Send>) {
     monitor.reset(&shared.hub);
 }
 
+/// The mixer's clock in frames, which is what a lock keeps time by,
+/// from a tempo tracker's count of analysis steps.
+fn frames_at(t: &Tempo) -> u64 {
+    t.now * HOP as u64
+}
+
 /// Whether a deck's length is known yet (it is once its song has loaded).
 fn feed_known(shared: &Shared, d: usize) -> bool {
     let feed = shared.decks[d].feed.lock().unwrap();
@@ -874,7 +874,6 @@ fn publish(shared: &Shared, m: &mut Mixer, gains: &[f32; SQUARES]) {
             bpm: t.bpm,
             phase: t.phase(),
             bar: t.bar_phase(),
-            level: m.decks[d].level,
             heard: gains[d],
             sync: if d == m.live { Sync::Locked } else { m.follow[d].sync() },
         };

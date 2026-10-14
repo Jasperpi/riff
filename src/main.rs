@@ -17,6 +17,7 @@ mod lyrics;
 mod model;
 mod mpris;
 mod out;
+mod party;
 mod pixels;
 mod pop;
 mod quad;
