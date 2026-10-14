@@ -101,7 +101,7 @@ fn main() {
             #[cfg(feature = "depth")]
             Some("doctor") if args.iter().any(|a| a == "--depth") => {
                 let number = |flag: &str| value(flag).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
-                depth_test(&value("--depth").unwrap_or_default(), number("--at"), number("--beat")).await
+                depth_test(&value("--depth").unwrap_or_default(), number("--at"), number("--beat"), value("--picture")).await
             }
             Some("doctor") if args.iter().any(|a| a == "--capture") => capture(value("--capture"), value("--query")).await,
             Some("doctor") if args.iter().any(|a| a == "--dj") => dj_test(value("--dj")).await,
@@ -1213,7 +1213,7 @@ fn snapshot(size: &str, keys: &str, frames: u32) -> Result<()> {
 /// --at 2.5 --beat 1`. Prints the depth map and the frame side by side as
 /// ANSI text, and how long the model took, to stderr.
 #[cfg(feature = "depth")]
-async fn depth_test(path: &str, at: f32, beat: f32) -> Result<()> {
+async fn depth_test(path: &str, at: f32, beat: f32, picture: Option<String>) -> Result<()> {
     let cover = image::load_from_memory(&std::fs::read(path)?)?.to_rgb8();
     if !depth::model_path().exists() {
         eprintln!("Fetching the depth model (27 MB)…");
@@ -1226,7 +1226,7 @@ async fn depth_test(path: &str, at: f32, beat: f32) -> Result<()> {
     let started = Instant::now();
     let mut bytes = 0;
     for frame in 0..40 {
-        let fx = art::Fx { beat: (frame % 8) as f32 / 8.0, bass: 0.5, time: frame as f32 * 0.05 };
+        let fx = art::Fx { beat: (frame % 8) as f32 / 8.0, bass: 0.5, time: frame as f32 * 0.05, beats: frame / 8, highs: 0.5, motes: 1.0, ..Default::default() };
         bytes += art::render_depth_rgb(&cover, &map, 432, 432, fx).len();
     }
     eprintln!("a 432x432 picture ({} KB) takes {:.1} ms to draw", bytes / 40 / 1024, started.elapsed().as_secs_f32() * 1000.0 / 40.0);
@@ -1258,7 +1258,13 @@ async fn depth_test(path: &str, at: f32, beat: f32) -> Result<()> {
         image::Rgb([v, v, v])
     });
     let left = art::render(&shades, w, h, art::ArtMode::Blocks);
-    let right = art::render_depth(&thumb, &map, w, h, art::Fx { beat, bass: beat * 0.6, time: at });
+    // Two beats a second, `at` seconds in, `beat` of the way into a beat's flash.
+    let fx = art::Fx { beat, bass: beat * 0.6, time: at, beats: (at * 2.0) as u64, through: (at * 2.0).fract(), highs: 0.4, motes: 1.0 };
+    let right = art::render_depth(&thumb, &map, w, h, fx);
+    if let Some(path) = picture {
+        let rgb = art::render_depth_rgb(&cover, &map, 512, 512, fx);
+        image::RgbImage::from_raw(512, 512, rgb).ok_or_else(|| anyhow!("bad picture"))?.save(path)?;
+    }
     let mut out = String::new();
     for row in 0..h as usize {
         for side in [&left, &right] {

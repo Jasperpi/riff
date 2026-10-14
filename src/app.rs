@@ -263,6 +263,11 @@ pub struct App {
     pub beats: u64,
     /// Smoothed low-end energy, 0..1.
     pub bass: f32,
+    /// Smoothed high-end energy, 0..1.
+    pub highs: f32,
+    /// Seconds between beats, judged from the last few, and seconds since the last.
+    pub beat_period: f32,
+    pub since_beat: f32,
     /// Animation time in seconds; runs faster when the music is louder.
     pub clock: f32,
     last_tick: Instant,
@@ -388,6 +393,9 @@ impl App {
             beat: 0.0,
             beats: 0,
             bass: 0.0,
+            highs: 0.0,
+            beat_period: 0.5,
+            since_beat: 0.0,
             clock: 0.0,
             last_tick: Instant::now(),
             fixed_step: None,
@@ -1790,6 +1798,10 @@ impl App {
             beat: (self.beat * 24.0).round() / 24.0,
             bass: (self.bass * 10.0).round() / 10.0,
             time: self.clock,
+            beats: self.beats,
+            through: ((self.since_beat / self.beat_period.max(0.2)).min(1.0) * 24.0).round() / 24.0,
+            highs: (self.highs * 10.0).round() / 10.0,
+            motes: 1.0,
         }
     }
 
@@ -2276,10 +2288,19 @@ impl App {
         // The beat envelope snaps to full on a hit and falls away in ~0.3 s.
         let was = self.beat;
         self.beat = (self.beat - dt * 3.4).max(0.0);
+        self.since_beat += dt;
         if live.is_some_and(|s| s.beat) {
             self.beat = 1.0;
             self.beats += 1;
+            // A gap that could be one beat (40 to 240 a minute) tunes the
+            // estimate; a missed beat or two would only throw it.
+            if (0.25..1.5).contains(&self.since_beat) {
+                self.beat_period += (self.since_beat - self.beat_period) * 0.3;
+            }
+            self.since_beat = 0.0;
         }
+        let treble = live.map_or(0.0, |s| s.bands[BANDS * 2 / 3..].iter().sum::<f32>() / (BANDS / 3) as f32);
+        self.highs += (treble - self.highs) * (dt * 8.0).min(1.0);
         let bass = live.map(|s| s.bass).unwrap_or(0.0);
         self.bass += (bass - self.bass) * (dt * 10.0).min(1.0);
         self.clock += dt * (0.6 + self.bass);
