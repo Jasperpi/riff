@@ -25,7 +25,7 @@ use crate::model::Track;
 use crate::out::Output;
 
 /// Frames mixed at a time: about 6 ms, which keeps the controls feeling immediate.
-const OUT: usize = 256;
+pub(crate) const OUT: usize = 256;
 /// Audio each deck keeps decoded ahead of the mixer: 0.25 s.
 const AHEAD: usize = 22_050;
 /// How far tempo may be bent either way.
@@ -34,8 +34,8 @@ pub const MAX_BEND: f32 = 0.12;
 // ---- tempo and beat tracking ------------------------------------------------
 
 /// Samples per analysis step: 344.5 steps a second, i.e. 2.9 ms resolution.
-const HOP: usize = 128;
-const HOPS_PER_SEC: f32 = RATE as f32 / HOP as f32;
+pub(crate) const HOP: usize = 128;
+pub(crate) const HOPS_PER_SEC: f32 = RATE as f32 / HOP as f32;
 /// Below this the music has no steady enough pulse to lock onto.
 const MIN_STRENGTH: f32 = 0.13;
 /// How much history the tempo estimate looks at.
@@ -53,6 +53,9 @@ pub struct Tempo {
     /// Onsets in the low end only: kick drums, which mark the beat itself
     /// rather than the off-beats in between.
     kicks: VecDeque<f32>,
+    /// Loudness of the whole sound at each step (log energy): what tells
+    /// the one from the other beats, which all have the same kick.
+    loud: VecDeque<f32>,
     /// Steps seen in total; the clock all beat times are expressed on.
     pub now: u64,
     since_estimate: usize,
@@ -61,6 +64,9 @@ pub struct Tempo {
     pub period: f32,
     /// Step at which a beat fell (any beat; the rest follow from `period`).
     pub beat_at: f64,
+    /// Step at which a bar began (a beat counted as the one), when there is
+    /// enough to go on.
+    pub bar_at: Option<f64>,
     /// How periodic the music is at the chosen tempo, 0..1.
     pub strength: f32,
     /// The last few period readings; their median is what gets reported.
@@ -77,11 +83,13 @@ impl Default for Tempo {
             recent: VecDeque::with_capacity(SMOOTH + LOOK + 2),
             onsets: VecDeque::with_capacity(WINDOW + 8),
             kicks: VecDeque::with_capacity(WINDOW + 8),
+            loud: VecDeque::with_capacity(WINDOW + 8),
             now: 0,
             since_estimate: 0,
             bpm: None,
             period: 0.0,
             beat_at: 0.0,
+            bar_at: None,
             strength: 0.0,
             readings: VecDeque::with_capacity(8),
         }
@@ -141,27 +149,29 @@ impl Tempo {
                     }
                     (low.ln(), full.ln())
                 };
-                let (onset, kick) = if self.recent.len() == SMOOTH + LOOK {
+                let (onset, kick, loud) = if self.recent.len() == SMOOTH + LOOK {
                     let (now, before) = (level(LOOK), level(0));
                     let kick = (now.0 - before.0).max(0.0);
                     // Capped, so one enormous hit (music starting from silence)
                     // cannot drown out the regular pulse.
-                    ((kick * 2.0 + (now.1 - before.1).max(0.0)).min(2.5), kick.min(1.5))
+                    ((kick * 2.0 + (now.1 - before.1).max(0.0)).min(2.5), kick.min(1.5), now.1)
                 } else {
-                    (0.0, 0.0)
+                    (0.0, 0.0, 0.0)
                 };
-                self.push(onset, kick);
+                self.push(onset, kick, loud);
             }
         }
     }
 
-    fn push(&mut self, onset: f32, kick: f32) {
+    fn push(&mut self, onset: f32, kick: f32, loud: f32) {
         if self.onsets.len() >= WINDOW {
             self.onsets.pop_front();
             self.kicks.pop_front();
+            self.loud.pop_front();
         }
         self.onsets.push_back(onset);
         self.kicks.push_back(kick);
+        self.loud.push_back(loud);
         self.now += 1;
         self.since_estimate += 1;
         // Re-estimate twice a second once there are four seconds to go on.
@@ -308,6 +318,53 @@ impl Tempo {
         self.period = period;
         self.bpm = Some(60.0 * HOPS_PER_SEC / period);
         self.beat_at = (self.now - 1) as f64 - (back + fine) as f64;
+        self.bar_at = self.find_bar();
+    }
+
+    /// Which beat starts the bar: of the four places in a bar, the one that
+    /// has hit hardest over the last few bars. Music puts its weight on the
+    /// one (a kick, a crash, the chord changing), though not always clearly
+    /// enough to tell, so a bar already found is kept unless another place
+    /// is plainly stronger.
+    fn find_bar(&self) -> Option<f64> {
+        let n = self.onsets.len();
+        let period = self.period as f64;
+        // The clock step of `onsets[0]`.
+        let first = self.now as f64 - n as f64;
+        let (mut sums, mut counts) = ([0f32; 4], [0u32; 4]);
+        for k in 0.. {
+            let at = self.beat_at - k as f64 * period - first;
+            if at < 2.0 {
+                break;
+            }
+            let i = at.round() as usize;
+            // The first 70 ms or so of the beat, as loud as it gets.
+            if i + 24 >= n {
+                continue;
+            }
+            let hit = self.loud.range(i..i + 24).sum::<f32>() / 24.0;
+            sums[k % 4] += hit;
+            counts[k % 4] += 1;
+        }
+        if counts.iter().any(|c| *c < 2) {
+            return None;
+        }
+        let mean: [f32; 4] = std::array::from_fn(|k| sums[k] / counts[k] as f32);
+        let best = (0..4).max_by(|a, b| mean[*a].total_cmp(&mean[*b])).unwrap_or(0);
+        let keep = self.bar_at.map(|bar| (4 - bar_beat(self.beat_at, bar, period)) % 4);
+        let pick = match keep {
+            // Loudness is in log terms: this is within about a fifth.
+            Some(k) if mean[best] - mean[k] < 0.2 => k,
+            _ => best,
+        };
+        Some(self.beat_at - pick as f64 * period)
+    }
+
+    /// Fraction of the way through the current bar, 0..1, when the bar is known.
+    pub fn bar_phase(&self) -> Option<f32> {
+        let bar = self.bar_at?;
+        self.bpm?;
+        Some((((self.now as f64 - bar) / (self.period as f64 * 4.0)).rem_euclid(1.0)) as f32)
     }
 
     /// Have the last few readings agreed? An intro or a breakdown can read
@@ -377,15 +434,22 @@ pub fn eq_label(step: i8) -> &'static str {
 
 /// One second-order filter section.
 #[derive(Clone, Copy, Default)]
-struct Biquad {
+pub(crate) struct Biquad {
     b: [f64; 3],
     a: [f64; 2],
     z: [f64; 2],
 }
 
 impl Biquad {
+    /// Move to a new frequency, keeping what is ringing through the filter
+    /// now, so a sweep glides rather than clicks.
+    pub(crate) fn retune(&mut self, hz: f64, high: bool) {
+        let fresh = Self::new(hz, high);
+        (self.b, self.a) = (fresh.b, fresh.a);
+    }
+
     /// A Butterworth low-pass or high-pass at `hz`.
-    fn new(hz: f64, high: bool) -> Self {
+    pub(crate) fn new(hz: f64, high: bool) -> Self {
         let w = std::f64::consts::TAU * hz / RATE;
         let (sin, cos) = w.sin_cos();
         let alpha = sin / std::f64::consts::SQRT_2;
@@ -398,7 +462,7 @@ impl Biquad {
         Self { b: b.map(|v| v / a0), a: [-2.0 * cos / a0, (1.0 - alpha) / a0], z: [0.0; 2] }
     }
 
-    fn run(&mut self, x: f64) -> f64 {
+    pub(crate) fn run(&mut self, x: f64) -> f64 {
         let y = self.b[0] * x + self.z[0];
         self.z[0] = self.b[1] * x - self.a[0] * y + self.z[1];
         self.z[1] = self.b[2] * x - self.a[1] * y;
@@ -443,7 +507,7 @@ impl Bands {
 /// One deck's EQ: the filters for both channels, the gains as they are being
 /// applied (they glide to where the knobs are), and how loud each band is.
 #[derive(Default)]
-struct Eq {
+pub(crate) struct Eq {
     channels: [Bands; 2],
     gain: Option<[f32; 3]>,
     level: [f32; 3],
@@ -451,7 +515,7 @@ struct Eq {
 
 impl Eq {
     /// Apply the knob positions `steps` to a block of interleaved stereo.
-    fn run(&mut self, block: &mut [f64], steps: [i8; 3]) {
+    pub(crate) fn run(&mut self, block: &mut [f64], steps: [i8; 3]) {
         let target = steps.map(eq_gain);
         let from = self.gain.unwrap_or(target);
         let frames = (block.len() / 2).max(1) as f32;
@@ -477,7 +541,7 @@ impl Eq {
     }
 
     /// Start from silence: no ringing carried over from whatever played before.
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
 }
@@ -486,27 +550,85 @@ impl Eq {
 
 /// Decoded audio waiting to be mixed, plus what the decoder knows.
 #[derive(Default)]
-struct Feed {
-    buf: VecDeque<f64>,
+pub(crate) struct Feed {
+    pub(crate) buf: VecDeque<f64>,
     /// Decode position in the song, in frames.
-    pos: u64,
-    dur: u64,
-    loading: bool,
+    pub(crate) pos: u64,
+    pub(crate) dur: u64,
+    pub(crate) loading: bool,
     /// The decoder reached the end; `buf` holds the last of the song.
-    ended: bool,
-    failed: bool,
+    pub(crate) ended: bool,
+    pub(crate) failed: bool,
     /// Bumped on every load and seek so the mixer starts clean.
-    generation: u64,
+    pub(crate) generation: u64,
 }
 
-struct DeckShared {
-    feed: Mutex<Feed>,
-    playing: AtomicBool,
+pub(crate) struct DeckShared {
+    pub(crate) feed: Mutex<Feed>,
+    pub(crate) playing: AtomicBool,
     /// Playback speed as f32 bits; 1.0 is the song's own tempo.
-    rate: AtomicU32,
+    pub(crate) rate: AtomicU32,
     /// EQ knobs for low, mid and high, in steps from flat (see `EQ_KILL`).
-    eq: [std::sync::atomic::AtomicI8; 3],
+    pub(crate) eq: [std::sync::atomic::AtomicI8; 3],
     events: Mutex<Option<PlayerEventChannel>>,
+}
+
+impl DeckShared {
+    /// Where in its song this deck is being heard, in milliseconds.
+    pub(crate) fn heard_ms(&self) -> u32 {
+        let feed = self.feed.lock().unwrap();
+        let heard = feed.pos.saturating_sub((feed.buf.len() / 2) as u64);
+        (heard * 10 / 441) as u32
+    }
+
+    /// Clear the feed for a song about to load at `start_ms`.
+    pub(crate) fn prepare(&self, start_ms: u32, duration_ms: u32) {
+        self.rate.store(1.0f32.to_bits(), Ordering::Relaxed);
+        let mut feed = self.feed.lock().unwrap();
+        feed.buf.clear();
+        feed.generation += 1;
+        feed.loading = true;
+        feed.ended = false;
+        feed.failed = false;
+        feed.pos = frames(start_ms);
+        feed.dur = frames(duration_ms);
+    }
+
+    /// The decoder's state as the interface shows it: loading, played to
+    /// the end, can't be played. Also takes in any news from the decoder.
+    pub(crate) fn status(&self) -> (bool, bool, bool) {
+        let mut feed = self.feed.lock().unwrap();
+        pump(self, &mut feed);
+        (feed.loading, feed.ended && feed.buf.len() < 4, feed.failed)
+    }
+}
+
+/// What the decoders use to wake a mixer waiting for audio.
+pub(crate) type Wake = (Mutex<()>, Condvar);
+
+/// A Spotify player whose decoded audio goes into `deck` rather than to a
+/// sound card, for a mixer to take from.
+pub(crate) fn deck_player(session: &Session, bitrate: Bitrate, normalise: bool, deck: Arc<DeckShared>, wake: Arc<Wake>) -> Arc<Player> {
+    let config = PlayerConfig { bitrate, normalisation: normalise, ..Default::default() };
+    let sink_deck = deck.clone();
+    let player = Player::new(config, session.clone(), Box::new(NoOpVolume), move || -> Box<dyn Sink> {
+        Box::new(DeckSink { deck: sink_deck, wake })
+    });
+    *deck.events.lock().unwrap() = Some(player.get_player_event_channel());
+    player
+}
+
+/// Tempo ratio and beat placement from leader to follower; both must be
+/// steady. See `beatmatch`.
+pub(crate) fn pair<T>(items: &mut [T], lead: usize, follow: usize) -> (&T, &mut T) {
+    assert_ne!(lead, follow);
+    if lead < follow {
+        let (a, b) = items.split_at_mut(follow);
+        (&a[lead], &mut b[0])
+    } else {
+        let (a, b) = items.split_at_mut(lead);
+        (&b[0], &mut a[follow])
+    }
 }
 
 impl Default for DeckShared {
@@ -523,8 +645,8 @@ impl Default for DeckShared {
 
 /// Keeps one deck's beats on the other's after they have been matched.
 /// Songs with a live drummer wander; this follows them.
-struct Lock {
-    follower: usize,
+pub(crate) struct Lock {
+    pub(crate) follower: usize,
     /// The follower's tempo setting that the corrections are made around.
     base: f32,
     integral: f32,
@@ -542,12 +664,11 @@ impl Lock {
     /// touch faster, and the reverse. The corrections are small and slow so the
     /// change in pitch is never heard, and a reading that looks wrong is
     /// ignored rather than acted on: this must never make things worse.
-    fn steer(&mut self, shared: &Shared, decks: &[DeckMix; 2], clock: u64) {
+    pub(crate) fn steer(&mut self, lead: &Tempo, follow: &Tempo, rate_bits: &AtomicU32, clock: u64) {
         if clock < self.next_at {
             return;
         }
         self.next_at = clock + (RATE / 2.0) as u64;
-        let (lead, follow) = (&decks[1 - self.follower].tempo, &decks[self.follower].tempo);
         // Until the follower has been re-measured there is nothing to correct,
         // and a faint or unsteady pulse is not worth chasing.
         if follow.heard() < 4.5 || follow.strength < 0.16 || lead.strength < 0.16 {
@@ -583,15 +704,15 @@ impl Lock {
         self.integral = (self.integral + behind * 0.006).clamp(-0.03, 0.03);
         let wanted = self.base * (1.0 + (behind * 0.08).clamp(-0.012, 0.012) + self.integral);
         // Move towards it gradually.
-        let now = load_f32(&shared.decks[self.follower].rate);
+        let now = load_f32(rate_bits);
         let rate = now + (wanted - now).clamp(-0.003, 0.003);
         let rate = rate.clamp(1.0 - MAX_BEND, 1.0 + MAX_BEND);
-        shared.decks[self.follower].rate.store(rate.to_bits(), Ordering::Relaxed);
+        rate_bits.store(rate.to_bits(), Ordering::Relaxed);
     }
 }
 
 impl Lock {
-    fn new(follower: usize, base: f32, clock: u64) -> Self {
+    pub(crate) fn new(follower: usize, base: f32, clock: u64) -> Self {
         Self { follower, base, integral: 0.0, next_at: clock, last: None, doubts: 0, offset: 0.0 }
     }
 }
@@ -630,17 +751,17 @@ struct Info {
 }
 
 struct Shared {
-    decks: [DeckShared; 2],
+    decks: [Arc<DeckShared>; 2],
     /// Crossfader position as f32 bits: 0 is all deck A, 1 is all deck B.
     fader: AtomicU32,
     requests: Mutex<Vec<Request>>,
     info: Mutex<Info>,
     quit: AtomicBool,
-    wake: (Mutex<()>, Condvar),
+    wake: Arc<Wake>,
     hub: Arc<Hub>,
 }
 
-fn load_f32(a: &AtomicU32) -> f32 {
+pub(crate) fn load_f32(a: &AtomicU32) -> f32 {
     f32::from_bits(a.load(Ordering::Relaxed))
 }
 
@@ -650,7 +771,7 @@ fn load_f32(a: &AtomicU32) -> f32 {
 /// before queueing each packet (events are emitted on its own thread, in order
 /// with the audio, so they mark exactly where a seek or a new song starts).
 /// The interface calls it too, so a paused deck still reports that it loaded.
-fn pump(deck: &DeckShared, feed: &mut Feed) {
+pub(crate) fn pump(deck: &DeckShared, feed: &mut Feed) {
     let mut events = deck.events.lock().unwrap();
     let Some(rx) = events.as_mut() else { return };
     while let Ok(event) = rx.try_recv() {
@@ -694,20 +815,19 @@ fn pump(deck: &DeckShared, feed: &mut Feed) {
 }
 
 struct DeckSink {
-    shared: Arc<Shared>,
-    deck: usize,
+    deck: Arc<DeckShared>,
+    wake: Arc<Wake>,
 }
 
 impl Sink for DeckSink {
     fn stop(&mut self) -> SinkResult<()> {
-        let deck = &self.shared.decks[self.deck];
-        pump(deck, &mut deck.feed.lock().unwrap());
+        pump(&self.deck, &mut self.deck.feed.lock().unwrap());
         Ok(())
     }
 
     fn write(&mut self, packet: AudioPacket, _: &mut Converter) -> SinkResult<()> {
         let Ok(samples) = packet.samples() else { return Ok(()) };
-        let deck = &self.shared.decks[self.deck];
+        let deck = &self.deck;
         let over = {
             let mut feed = deck.feed.lock().unwrap();
             pump(deck, &mut feed);
@@ -715,7 +835,7 @@ impl Sink for DeckSink {
             feed.pos += (samples.len() / 2) as u64;
             feed.buf.len() > AHEAD * 2
         };
-        self.shared.wake.1.notify_all();
+        self.wake.1.notify_all();
         // Pace the decoder rather than block it, so seek and pause get through.
         if over {
             let length = Duration::from_secs_f64(samples.len() as f64 / 2.0 / RATE);
@@ -728,21 +848,21 @@ impl Sink for DeckSink {
 // ---- mixer thread -----------------------------------------------------------
 
 #[derive(Default)]
-struct DeckMix {
+pub(crate) struct DeckMix {
     /// Fractional read position within the feed, in frames.
     phase: f64,
-    generation: u64,
+    pub(crate) generation: u64,
     /// Silence still owed before this deck resumes (used to line beats up).
-    hold: usize,
-    tempo: Tempo,
-    eq: Eq,
-    level: f32,
-    was_playing: bool,
+    pub(crate) hold: usize,
+    pub(crate) tempo: Tempo,
+    pub(crate) eq: Eq,
+    pub(crate) level: f32,
+    pub(crate) was_playing: bool,
 }
 
 /// Read `OUT` frames from a deck at `rate`, resampling as needed. Returns how
 /// many frames were real audio.
-fn pull(feed: &mut Feed, mix: &mut DeckMix, rate: f64, out: &mut [f64]) -> usize {
+pub(crate) fn pull(feed: &mut Feed, mix: &mut DeckMix, rate: f64, out: &mut [f64]) -> usize {
     out.fill(0.0);
     if feed.generation != mix.generation {
         mix.generation = feed.generation;
@@ -832,7 +952,8 @@ fn mixer_loop(shared: Arc<Shared>, volume: Box<dyn VolumeGetter + Send>) {
                     }
                 }
                 Request::Sync { deck } => {
-                    let note = beatmatch(&shared, &mut decks, deck);
+                    let (lead, follow) = pair(&mut decks, 1 - deck, deck);
+                    let note = beatmatch(&shared.decks[deck].rate, &lead.tempo, follow, false);
                     if note.is_ok() {
                         lock = Some(Lock::new(deck, load_f32(&shared.decks[deck].rate), clock));
                     }
@@ -875,7 +996,8 @@ fn mixer_loop(shared: Arc<Shared>, volume: Box<dyn VolumeGetter + Send>) {
                 progress = Some((to, 0.0, true));
                 let mut begin = None;
                 if ready && clock % (RATE as u64 / 2) < OUT as u64 {
-                    match beatmatch(&shared, &mut decks, to) {
+                    let (lead, follow) = pair(&mut decks, 1 - to, to);
+                    match beatmatch(&shared.decks[to].rate, &lead.tempo, follow, false) {
                         Ok(note) => {
                             lock = Some(Lock::new(to, load_f32(&shared.decks[to].rate), clock));
                             begin = Some(note);
@@ -912,7 +1034,10 @@ fn mixer_loop(shared: Arc<Shared>, volume: Box<dyn VolumeGetter + Send>) {
         // ---- keep matched decks together, for as long as both are playing
         let both = shared.decks[0].playing.load(Ordering::Relaxed) && shared.decks[1].playing.load(Ordering::Relaxed);
         match lock.as_mut() {
-            Some(l) if both => l.steer(&shared, &decks, clock),
+            Some(l) if both => {
+                let f = l.follower;
+                l.steer(&decks[1 - f].tempo, &decks[f].tempo, &shared.decks[f].rate, clock)
+            }
             Some(_) => lock = None,
             None => {}
         }
@@ -1031,22 +1156,22 @@ fn locked_deck(lock: &Option<Lock>) -> Option<usize> {
     lock.as_ref().map(|l| l.follower)
 }
 
-/// Bend deck `d`'s tempo to the other deck's and slide it so the beats coincide.
-fn beatmatch(shared: &Shared, decks: &mut [DeckMix; 2], d: usize) -> Result<String> {
-    let (lead_bpm, lead_period, lead_beat) = {
-        let t = &decks[1 - d].tempo;
-        (t.bpm, t.period, t.beat_at)
-    };
-    let (follow_bpm, period, follow_beat, now) = {
-        let t = &decks[d].tempo;
-        (t.bpm, t.period as f64, t.beat_at, t.now as f64)
+/// Bend `follow`'s tempo to `lead`'s and slide it so the beats coincide.
+/// With `bars`, the bars are lined up too where both songs' downbeats are
+/// known, so a chorus lands on the one rather than on any beat. That costs
+/// up to a bar of silence on the follower: only for a deck that can't be heard.
+pub(crate) fn beatmatch(rate: &AtomicU32, lead: &Tempo, follow: &mut DeckMix, bars: bool) -> Result<String> {
+    let (lead_bpm, lead_period, lead_beat, lead_bar) = (lead.bpm, lead.period, lead.beat_at, lead.bar_at);
+    let (follow_bpm, period, follow_beat, follow_bar, now) = {
+        let t = &follow.tempo;
+        (t.bpm, t.period as f64, t.beat_at, t.bar_at, t.now as f64)
     };
     let (Some(lead_bpm), Some(follow_bpm)) = (lead_bpm, follow_bpm) else {
         return Err(anyhow!("Both decks need to play a few seconds before they can be matched"));
     };
     let ratio = match_ratio(follow_bpm, lead_bpm)
         .ok_or_else(|| anyhow!("{follow_bpm:.0} and {lead_bpm:.0} BPM are too far apart to match"))?;
-    let new_rate = load_f32(&shared.decks[d].rate) * ratio;
+    let new_rate = load_f32(rate) * ratio;
     if !((1.0 - MAX_BEND)..=(1.0 + MAX_BEND)).contains(&new_rate) {
         return Err(anyhow!("Matching would bend the tempo more than {:.0}%", MAX_BEND * 100.0));
     }
@@ -1057,18 +1182,38 @@ fn beatmatch(shared: &Shared, decks: &mut [DeckMix; 2], d: usize) -> Result<Stri
     let offset = beat_offset(lead_beat, next_beat, lead_period as f64);
     // Delaying is always possible; advancing needs audio already decoded. A
     // delay of one full beat minus the advance lands in the same place.
-    let delay_steps = if offset >= 0.0 { offset } else { offset + lead_period as f64 };
+    let mut delay_steps = if offset >= 0.0 { offset } else { offset + lead_period as f64 };
 
-    shared.decks[d].rate.store(new_rate.to_bits(), Ordering::Relaxed);
-    decks[d].hold += (delay_steps * HOP as f64) as usize;
+    // Which beat of its bar each side is on where they meet. Only when both
+    // count the same pulse: a song read at double time has bars of its own.
+    let same_count = (lead_bpm / follow_bpm - 1.0).abs() <= MAX_BEND;
+    let mut barred = false;
+    if let (true, true, Some(lead_bar), Some(follow_bar)) = (bars, same_count, lead_bar, follow_bar) {
+        let lands = next_beat + delay_steps;
+        let at_lead = bar_beat(lands, lead_bar, lead_period as f64);
+        let at_follow = bar_beat(now + until_next, follow_bar, period);
+        delay_steps += ((at_follow + 4 - at_lead) % 4) as f64 * lead_period as f64;
+        barred = true;
+    }
+
+    rate.store(new_rate.to_bits(), Ordering::Relaxed);
+    follow.hold += (delay_steps * HOP as f64) as usize;
     // The follower now shares the leader's grid; carry that over so the
     // display and any further matching stay right while it re-measures.
-    let tempo = &mut decks[d].tempo;
+    let tempo = &mut follow.tempo;
     tempo.reset();
     tempo.bpm = Some(lead_bpm);
     tempo.period = lead_period;
     tempo.beat_at = lead_beat;
-    Ok(format!("Beat-matched at {lead_bpm:.0} BPM ({:+.1}% tempo)", (new_rate - 1.0) * 100.0))
+    tempo.bar_at = if barred || !bars { lead_bar } else { None };
+    let what = if barred { "Bar-matched" } else { "Beat-matched" };
+    Ok(format!("{what} at {lead_bpm:.0} BPM ({:+.1}% tempo)", (new_rate - 1.0) * 100.0))
+}
+
+/// Which beat of the bar (0 is the downbeat) falls at step `at`, given a
+/// downbeat at `bar` and beats `period` steps long.
+pub(crate) fn bar_beat(at: f64, bar: f64, period: f64) -> usize {
+    (((at - bar) / period).round() as i64).rem_euclid(4) as usize
 }
 
 // ---- the interface's handle -------------------------------------------------
@@ -1114,23 +1259,15 @@ impl Dj {
         normalise: bool,
     ) -> Self {
         let shared = Arc::new(Shared {
-            decks: [DeckShared::default(), DeckShared::default()],
+            decks: Default::default(),
             fader: AtomicU32::new(0.0f32.to_bits()),
             requests: Mutex::default(),
             info: Mutex::default(),
             quit: AtomicBool::new(false),
-            wake: (Mutex::new(()), Condvar::new()),
+            wake: Arc::new((Mutex::new(()), Condvar::new())),
             hub,
         });
-        let players = [0, 1].map(|deck| {
-            let sink_shared = shared.clone();
-            let config = PlayerConfig { bitrate, normalisation: normalise, ..Default::default() };
-            let player = Player::new(config, session.clone(), Box::new(NoOpVolume), move || -> Box<dyn Sink> {
-                Box::new(DeckSink { shared: sink_shared, deck })
-            });
-            *shared.decks[deck].events.lock().unwrap() = Some(player.get_player_event_channel());
-            player
-        });
+        let players = [0, 1].map(|deck| deck_player(&session, bitrate, normalise, shared.decks[deck].clone(), shared.wake.clone()));
         let mixer_shared = shared.clone();
         std::thread::Builder::new()
             .name("riff-dj".into())
@@ -1149,17 +1286,7 @@ impl Dj {
     pub fn load(&mut self, deck: usize, track: Track, start_ms: u32, play: bool) -> Result<()> {
         let uri = SpotifyUri::from_uri(&track.uri).map_err(|_| anyhow!("That can't be loaded on a deck"))?;
         let d = &self.shared.decks[deck];
-        d.rate.store(1.0f32.to_bits(), Ordering::Relaxed);
-        {
-            let mut feed = d.feed.lock().unwrap();
-            feed.buf.clear();
-            feed.generation += 1;
-            feed.loading = true;
-            feed.ended = false;
-            feed.failed = false;
-            feed.pos = frames(start_ms);
-            feed.dur = frames(track.duration_ms);
-        }
+        d.prepare(start_ms, track.duration_ms);
         d.playing.store(play, Ordering::Relaxed);
         self.players[deck].load(uri, play, start_ms);
         self.tracks[deck] = Some(track);
@@ -1210,9 +1337,7 @@ impl Dj {
     }
 
     fn position(&self, deck: usize) -> u32 {
-        let feed = self.shared.decks[deck].feed.lock().unwrap();
-        let heard = feed.pos.saturating_sub((feed.buf.len() / 2) as u64);
-        (heard * 10 / 441) as u32
+        self.shared.decks[deck].heard_ms()
     }
 
     /// Change a deck's tempo by `delta` (0.005 = half a percent).
@@ -1302,12 +1427,7 @@ impl Dj {
         }
         let mut view = View { fader: self.fader(), auto: info.auto, locked: info.locked, ..Default::default() };
         for d in 0..2 {
-            let (loading, ended, failed) = {
-                let deck = &self.shared.decks[d];
-                let mut feed = deck.feed.lock().unwrap();
-                pump(deck, &mut feed);
-                (feed.loading, feed.ended && feed.buf.len() < 4, feed.failed)
-            };
+            let (loading, ended, failed) = self.shared.decks[d].status();
             view.decks[d] = DeckView {
                 track: self.tracks[d].clone(),
                 playing: self.is_playing(d),
@@ -1373,6 +1493,45 @@ mod tests {
             let ok = [0.5, 1.0, 2.0].iter().any(|m| (found - bpm * m).abs() < 0.6);
             assert!(ok, "{bpm} BPM read as {found:.2}");
         }
+    }
+
+    #[test]
+    fn finds_the_one() {
+        // Kick on every beat, and on the first of each four a crash as well.
+        for (bpm, offset) in [(120.0, 0.35), (120.0, 1.6), (126.0, 0.1), (98.0, 2.2)] {
+            one_found_at(bpm, offset);
+        }
+    }
+
+    fn one_found_at(bpm: f64, offset: f64) {
+        let beat = 60.0 / bpm;
+        let mut audio = click_track(bpm, offset, 14.0);
+        for (i, pair) in audio.chunks_exact_mut(2).enumerate() {
+            let t = i as f64 / RATE;
+            let into = (t - offset).rem_euclid(beat * 4.0);
+            if t >= offset && into < 0.15 {
+                let crash = (((i * 2_654_435_761) % 10_007) as f64 / 10_007.0 - 0.5) * 1.2 * (1.0 - into / 0.15);
+                pair[0] += crash;
+                pair[1] += crash;
+            }
+        }
+        let mut tempo = Tempo::default();
+        for chunk in audio.chunks(OUT * 2) {
+            tempo.feed(chunk);
+        }
+        let bar = tempo.bar_at.expect("no bar found") / HOPS_PER_SEC as f64;
+        let off = (bar - offset).rem_euclid(beat * 4.0);
+        let off = off.min(beat * 4.0 - off);
+        assert!(off < 0.03, "{bpm} BPM from {offset} s: the bar starts {off:.3} s from the crash");
+        assert!(tempo.bar_phase().is_some());
+    }
+
+    #[test]
+    fn bar_beats_count_round_from_the_one() {
+        assert_eq!(bar_beat(100.0, 100.0, 50.0), 0);
+        assert_eq!(bar_beat(152.0, 100.0, 50.0), 1);
+        assert_eq!(bar_beat(298.0, 100.0, 50.0), 0);
+        assert_eq!(bar_beat(48.0, 100.0, 50.0), 3);
     }
 
     #[test]

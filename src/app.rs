@@ -32,6 +32,8 @@ pub enum Screen {
     NowPlaying,
     /// The two DJ decks.
     Decks,
+    /// Four songs, four squares, the arrows to pick between them.
+    Quad,
 }
 
 /// A run of rows being selected with V, vim-visual style.
@@ -65,6 +67,8 @@ pub enum Hit {
     SidePane,
     OverlayRow(usize),
     NowPlayingArt,
+    /// One of the four squares.
+    Square(usize),
 }
 
 pub struct Tab {
@@ -259,12 +263,19 @@ pub struct App {
     pub beats: u64,
     /// Smoothed low-end energy, 0..1.
     pub bass: f32,
+    /// Smoothed high-end energy, 0..1.
+    pub highs: f32,
+    /// Seconds between beats, judged from the last few, and seconds since the last.
+    pub beat_period: f32,
+    pub since_beat: f32,
     /// Animation time in seconds; runs faster when the music is louder.
     pub clock: f32,
     last_tick: Instant,
     pub fixed_step: Option<f32>,
     /// The whole interface dances to the music.
     pub party: bool,
+    /// Which scene party mode is showing, and whether the music just dropped.
+    pub rave: crate::party::Rave,
 
     /// Songs marked with x / ctrl-click. Kept across pages and searches so a
     /// queue can be assembled from anywhere.
@@ -279,6 +290,14 @@ pub struct App {
     /// The deck that seek, tempo and space act on.
     pub deck_focus: usize,
     deck_demo: bool,
+    /// The four-square mode, when it is on.
+    pub quad: Option<crate::quad::Quad>,
+    /// What the squares looked like at the last tick.
+    pub squares: crate::quad::View,
+    /// Songs waiting their turn in a square, as squares' songs finish.
+    pub crate_songs: VecDeque<Track>,
+    /// Pretend squares for demo mode.
+    quad_demo: Option<DemoQuad>,
     /// The last key that costs Spotify a request, and when, to tell a held
     /// key's repeats from separate presses.
     last_command: Option<(KeyCode, Instant)>,
@@ -376,10 +395,14 @@ impl App {
             beat: 0.0,
             beats: 0,
             bass: 0.0,
+            highs: 0.0,
+            beat_period: 0.5,
+            since_beat: 0.0,
             clock: 0.0,
             last_tick: Instant::now(),
             fixed_step: None,
             party: false,
+            rave: Default::default(),
             basket: Vec::new(),
             queued: VecDeque::new(),
             range: None,
@@ -387,6 +410,10 @@ impl App {
             decks: Default::default(),
             deck_focus: 0,
             deck_demo: false,
+            quad: None,
+            squares: Default::default(),
+            crate_songs: VecDeque::new(),
+            quad_demo: None,
             last_command: None,
             pending_seek: None,
             pending_volume: None,
@@ -473,7 +500,8 @@ impl App {
         let sounding = (self.pb.playing && (self.pb.local || self.demo)) || decks_playing;
         let reactive =
             self.cfg.visualizer || self.party || matches!(self.art_mode, ArtMode::Pulse | ArtMode::Depth);
-        if decks_playing && self.screen == Screen::Decks {
+        let squares_playing = self.quad_on() && !self.squares.paused;
+        if (decks_playing && self.screen == Screen::Decks) || (squares_playing && self.screen == Screen::Quad) {
             Duration::from_millis(33)
         } else if self.party && sounding {
             // Party mode repaints the whole screen; 25 frames a second is plenty.
@@ -642,6 +670,9 @@ impl App {
     }
 
     fn play_pause(&mut self) {
+        if self.quad_on() {
+            return self.quad_pause();
+        }
         if self.decks_on() {
             return self.deck_toggle(self.deck_focus);
         }
@@ -697,6 +728,12 @@ impl App {
     }
 
     fn skip(&mut self, forward: bool) {
+        if self.quad_on() {
+            // Round the squares: n clockwise, p the other way.
+            let from = self.squares.target();
+            let to = if forward { crate::quad::clockwise(from) } else { (0..3).fold(from, |d, _| crate::quad::clockwise(d)) };
+            return self.quad_go(to, false);
+        }
         if self.decks_on() {
             return self.toast("The decks are on: m mixes in the other deck. D on the decks screen switches them off", false);
         }
@@ -710,6 +747,9 @@ impl App {
     }
 
     fn seek_by(&mut self, delta_ms: i64) {
+        if self.quad_on() {
+            return self.toast("The squares keep time with each other: pick a square instead", false);
+        }
         if self.decks_on() {
             if let Some(dj) = self.dj.as_mut() {
                 dj.seek_by(self.deck_focus, delta_ms);
@@ -846,6 +886,9 @@ impl App {
         };
         if !track.playable {
             return self.toast("That track isn't available", true);
+        }
+        if self.quad_on() {
+            return self.quad_fill(None, track);
         }
         if self.decks_on() {
             return self.deck_load(None, track);
@@ -1014,6 +1057,9 @@ impl App {
     fn decks_start(&mut self) -> bool {
         if self.decks_on() {
             return true;
+        }
+        if self.quad_on() {
+            self.quad_stop(false);
         }
         if self.demo {
             self.deck_demo = true;
@@ -1213,6 +1259,297 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    // ---- four squares ---------------------------------------------------
+
+    pub fn quad_on(&self) -> bool {
+        self.quad.is_some() || self.quad_demo.is_some()
+    }
+
+    /// 4: open the four squares (starting them if need be); on that screen, stop them.
+    fn quad_key(&mut self) {
+        if self.screen == Screen::Quad {
+            return self.quad_stop(true);
+        }
+        if self.quad_on() || self.quad_start() {
+            self.screen = Screen::Quad;
+        }
+    }
+
+    /// The songs to start the squares with, and the rest of the list after
+    /// them, to take over squares whose songs finish. Whatever is playing
+    /// comes first, carrying on where it is; then songs marked with x; then
+    /// the list on screen from the cursor down; then the queue.
+    fn quad_picks(&self) -> (Vec<(Track, u32)>, VecDeque<Track>) {
+        let usable = |t: &Track| t.playable && t.uri.starts_with("spotify:track:");
+        let mut picks: Vec<(Track, u32)> = Vec::new();
+        let mut seen = HashSet::new();
+        if let Some(t) = self.pb.track.clone().filter(|t| usable(t) && self.pb.playing && (self.pb.local || self.demo)) {
+            seen.insert(t.uri.clone());
+            let at = self.position();
+            picks.push((t, at));
+        }
+        let listed: Vec<Track> = self
+            .page()
+            .map(|page| {
+                let tab = page.cur();
+                let rows = tab.view.len();
+                (0..rows)
+                    .map(|k| (tab.sel + k) % rows.max(1))
+                    .filter_map(|row| match tab.items.get(*tab.view.get(row)?) {
+                        Some(Item::Track(t)) => Some(t.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut rest = VecDeque::new();
+        for t in self.basket.iter().chain(&listed).chain(&self.queue) {
+            if !usable(t) || !seen.insert(t.uri.clone()) {
+                continue;
+            }
+            if picks.len() < crate::quad::SQUARES {
+                picks.push((t.clone(), start_point(t)));
+            } else if rest.len() < 200 {
+                rest.push_back(t.clone());
+            }
+        }
+        (picks, rest)
+    }
+
+    fn quad_start(&mut self) -> bool {
+        let (picks, rest) = self.quad_picks();
+        if picks.len() < 2 {
+            self.toast("The squares need songs: open a playlist (or mark some with x) and press 4", false);
+            return false;
+        }
+        if self.decks_on() {
+            self.dj = None;
+            self.deck_demo = false;
+            self.decks = Default::default();
+        }
+        if self.demo {
+            self.squares = Default::default();
+            for (d, (track, at)) in picks.into_iter().enumerate() {
+                if let Some(url) = &track.image {
+                    self.want_image(&url.clone());
+                }
+                self.squares.squares[d].track = Some(track);
+                self.squares.squares[d].pos_ms = at;
+            }
+            self.quad_demo = Some(DemoQuad { since: self.frame, ..Default::default() });
+        } else {
+            let Some(be) = self.backend.clone() else { return false };
+            let Some((session, volume)) = be.engine.deck_parts() else {
+                self.toast("Still connecting to Spotify…", true);
+                return false;
+            };
+            let mut quad = crate::quad::Quad::start(session, volume, self.hub.clone(), be.engine.bitrate(), be.engine.normalize());
+            if self.pb.local && self.pb.playing {
+                let _ = be.engine.play_pause();
+            }
+            for (d, (track, at)) in picks.into_iter().enumerate() {
+                if let Some(url) = &track.image {
+                    self.want_image(&url.clone());
+                }
+                if let Err(e) = quad.load(d, track, at) {
+                    self.toast(e.to_string(), true);
+                }
+            }
+            self.quad = Some(quad);
+        }
+        self.crate_songs = rest;
+        self.basket.clear();
+        self.toast("Four squares. Arrows pick the next song; it comes in on the beat", false);
+        true
+    }
+
+    fn quad_stop(&mut self, say: bool) {
+        self.quad = None;
+        self.quad_demo = None;
+        self.squares = Default::default();
+        self.crate_songs.clear();
+        if self.screen == Screen::Quad {
+            self.screen = Screen::Browse;
+        }
+        if say {
+            self.toast("Squares off. Space carries on where you were", false);
+        }
+    }
+
+    /// Head for square `to`. `slam` asks for a drop rather than whatever suits.
+    fn quad_go(&mut self, to: usize, slam: bool) {
+        let to = to % crate::quad::SQUARES;
+        if self.squares.squares[to].track.is_none() {
+            return self.toast(format!("Square {} is empty: esc, then enter on a song to fill it", to + 1), false);
+        }
+        if let Some(quad) = &self.quad {
+            quad.go(to, slam);
+        } else if let Some(demo) = self.quad_demo.as_mut() {
+            demo.go(to, slam, self.frame);
+        }
+        // Shown as picked at once; the engine says when it will land.
+        self.dirty = true;
+    }
+
+    fn quad_pause(&mut self) {
+        if let Some(quad) = self.quad.as_mut() {
+            let paused = !quad.paused();
+            quad.set_paused(paused);
+        } else if let Some(demo) = self.quad_demo.as_mut() {
+            demo.paused = !demo.paused;
+        }
+    }
+
+    /// Put a song in a square: the one asked for, or else an empty one, or
+    /// else the one that has been quiet longest. Never the one being heard.
+    fn quad_fill(&mut self, square: Option<usize>, track: Track) {
+        if !track.uri.starts_with("spotify:track:") || !track.playable {
+            return self.toast("Only songs can go in a square", false);
+        }
+        let live = self.squares.live;
+        let target = self.squares.target();
+        let d = square.unwrap_or_else(|| {
+            let free = (0..crate::quad::SQUARES).find(|d| self.squares.squares[*d].track.is_none());
+            free.unwrap_or_else(|| {
+                (1..crate::quad::SQUARES).map(|k| (live + k) % crate::quad::SQUARES).find(|d| *d != target).unwrap_or((live + 1) % 4)
+            })
+        });
+        if d == live && square.is_none() {
+            return;
+        }
+        if let Some(url) = &track.image {
+            self.want_image(&url.clone());
+        }
+        let name = track.name.clone();
+        let at = start_point(&track);
+        if let Some(quad) = self.quad.as_mut() {
+            if let Err(e) = quad.load(d, track.clone(), at) {
+                return self.toast(e.to_string(), true);
+            }
+        }
+        self.squares.squares[d] = crate::quad::SquareView { track: Some(track), pos_ms: at, ..Default::default() };
+        self.toast(format!("Square {}: {name}", d + 1), false);
+    }
+
+    /// Keys on the squares screen. Returns whether the key was one of them.
+    fn on_quad_key(&mut self, key: KeyEvent) -> bool {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let from = self.squares.target();
+        match key.code {
+            KeyCode::Left | KeyCode::Right => self.quad_go(crate::quad::neighbour(from, true), shift),
+            KeyCode::Up | KeyCode::Down => self.quad_go(crate::quad::neighbour(from, false), shift),
+            // Surprise me: somewhere else, chosen by the beat.
+            KeyCode::Tab => {
+                let live = self.squares.live;
+                let others: Vec<usize> = (0..crate::quad::SQUARES)
+                    .filter(|d| *d != live && self.squares.squares[*d].track.is_some())
+                    .collect();
+                if let Some(d) = others.get(self.beats as usize % others.len().max(1)) {
+                    self.quad_go(*d, false);
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(quad) = &self.quad {
+                    quad.stutter();
+                } else if let Some(demo) = self.quad_demo.as_mut() {
+                    demo.stutter_until = self.frame + 15 + (15 - self.frame % 15);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Keep up with the squares: what they are doing, and new songs for
+    /// squares whose songs have finished.
+    fn quad_tick(&mut self) {
+        if let Some(quad) = self.quad.as_mut() {
+            let (view, notes) = quad.view();
+            self.squares = view;
+            for note in notes {
+                self.toast(note, false);
+            }
+        } else if self.quad_demo.is_some() {
+            self.demo_quad();
+        } else {
+            return;
+        }
+        if !self.squares.paused {
+            self.dirty = true;
+        }
+        // A finished song makes way for the next one waiting, or starts over.
+        let live = self.squares.live;
+        for d in 0..crate::quad::SQUARES {
+            let sq = &self.squares.squares[d];
+            let done = sq.track.is_some() && !sq.loading && (sq.ended || sq.failed);
+            if !done || d == live {
+                continue;
+            }
+            let next = self.crate_songs.pop_front().or_else(|| sq.track.clone().filter(|_| !sq.failed));
+            match next {
+                Some(track) => {
+                    let name = track.name.clone();
+                    if let Some(url) = &track.image {
+                        self.want_image(&url.clone());
+                    }
+                    let at = start_point(&track);
+                    if let Some(quad) = self.quad.as_mut() {
+                        let _ = quad.load(d, track.clone(), at);
+                    }
+                    self.squares.squares[d] = crate::quad::SquareView { track: Some(track), pos_ms: at, ..Default::default() };
+                    log::info!("square {}: {name}", d + 1);
+                }
+                None => self.squares.squares[d] = Default::default(),
+            }
+        }
+    }
+
+    /// Move the pretend squares along, on the demo's own beat.
+    fn demo_quad(&mut self) {
+        use crate::quad::{Meter, Next, Sync};
+        let frame = self.frame;
+        let Some(demo) = self.quad_demo.as_mut() else { return };
+        demo.step(frame);
+        let beat = (frame % DEMO_BEAT) as f32 / DEMO_BEAT as f32;
+        let bar = (frame % (DEMO_BEAT * 4)) as f32 / (DEMO_BEAT * 4) as f32;
+        let mut heard = [0.0; crate::quad::SQUARES];
+        let next = match demo.next {
+            Some((to, mv, at, length)) if frame >= at => {
+                let p = ((frame - at) as f32 / length.max(1) as f32).clamp(0.0, 1.0);
+                let ((out, _), (inn, _)) = crate::quad::blend_at(mv, p);
+                heard[demo.live] = out;
+                heard[to] = inn;
+                Some(Next { to, mv, beats_left: 0.0, progress: Some(p) })
+            }
+            Some((to, mv, at, _)) => {
+                heard[demo.live] = 1.0;
+                Some(Next { to, mv, beats_left: (at - frame) as f32 / DEMO_BEAT as f32, progress: None })
+            }
+            None => {
+                heard[demo.live] = 1.0;
+                None
+            }
+        };
+        self.squares.live = demo.live;
+        self.squares.next = next;
+        self.squares.paused = demo.paused;
+        self.squares.stuttering = frame < demo.stutter_until;
+        for (d, sq) in self.squares.squares.iter_mut().enumerate() {
+            let Some(track) = &sq.track else { continue };
+            sq.playing = !demo.paused;
+            if sq.playing {
+                sq.pos_ms = (sq.pos_ms + 33) % track.duration_ms.max(1);
+            }
+            sq.meter = Meter {
+                bpm: Some(120.0),
+                phase: Some(beat),
+                bar: Some(bar),
+                heard: heard[d],
+                sync: Sync::Locked,
+            };
+        }
     }
 
     fn clear_marks(&mut self) {
@@ -1463,6 +1800,10 @@ impl App {
             beat: (self.beat * 24.0).round() / 24.0,
             bass: (self.bass * 10.0).round() / 10.0,
             time: self.clock,
+            beats: self.beats,
+            through: ((self.since_beat / self.beat_period.max(0.2)).min(1.0) * 24.0).round() / 24.0,
+            highs: (self.highs * 10.0).round() / 10.0,
+            motes: 1.0,
         }
     }
 
@@ -1739,8 +2080,13 @@ impl App {
                     self.image_failed.clear();
                     if let Some(be) = &self.backend {
                         be.load_sidebar();
-                        if let (Some(dj), Some((session, _))) = (&self.dj, be.engine.deck_parts()) {
-                            dj.set_session(&session);
+                        if let Some((session, _)) = be.engine.deck_parts() {
+                            if let Some(dj) = &self.dj {
+                                dj.set_session(&session);
+                            }
+                            if let Some(quad) = &self.quad {
+                                quad.set_session(&session);
+                            }
                         }
                     }
                     // Pages opened while offline were left waiting; load them now.
@@ -1944,9 +2290,26 @@ impl App {
         // The beat envelope snaps to full on a hit and falls away in ~0.3 s.
         let was = self.beat;
         self.beat = (self.beat - dt * 3.4).max(0.0);
+        self.since_beat += dt;
         if live.is_some_and(|s| s.beat) {
             self.beat = 1.0;
             self.beats += 1;
+            // A gap that could be one beat (40 to 240 a minute) tunes the
+            // estimate; a missed beat or two would only throw it.
+            if (0.25..1.5).contains(&self.since_beat) {
+                self.beat_period += (self.since_beat - self.beat_period) * 0.3;
+            }
+            self.since_beat = 0.0;
+        }
+        let treble = live.map_or(0.0, |s| s.bands[BANDS * 2 / 3..].iter().sum::<f32>() / (BANDS / 3) as f32);
+        self.highs += (treble - self.highs) * (dt * 8.0).min(1.0);
+        if self.party {
+            let level = live.map_or(0.0, |s| s.bands.iter().sum::<f32>() / BANDS as f32);
+            let scene = self.rave.scene;
+            self.rave.tick(dt, level, live.is_some_and(|s| s.beat), self.beats);
+            if self.rave.scene != scene && self.rave.drop > 0.9 {
+                self.dirty = true;
+            }
         }
         let bass = live.map(|s| s.bass).unwrap_or(0.0);
         self.bass += (bass - self.bass) * (dt * 10.0).min(1.0);
@@ -1975,6 +2338,7 @@ impl App {
         } else if self.deck_demo {
             self.demo_decks();
         }
+        self.quad_tick();
 
         let sec = self.position() / 1000;
         if sec != self.last_shown_sec {
@@ -2141,6 +2505,9 @@ impl App {
         if self.screen == Screen::Decks && self.on_decks_key(key) {
             return;
         }
+        if self.screen == Screen::Quad && self.on_quad_key(key) {
+            return;
+        }
 
         // A held key repeats some thirty times a second. For keys that each
         // send Spotify a command, only the first press of a run counts: a
@@ -2163,6 +2530,7 @@ impl App {
         // Keys that work everywhere.
         match key.code {
             KeyCode::Char('D') => return self.decks_key(),
+            KeyCode::Char('4') => return self.quad_key(),
             KeyCode::Char('q') => return self.quit = true,
             KeyCode::Char('?') => return self.overlay = Overlay::Help { page: 0 },
             KeyCode::Char('/') => return self.overlay = Overlay::Search { input: String::new() },
@@ -2233,7 +2601,7 @@ impl App {
             KeyCode::Esc | KeyCode::Backspace => return self.back(),
             _ => {}
         }
-        if self.screen == Screen::Decks {
+        if matches!(self.screen, Screen::Decks | Screen::Quad) {
             return;
         }
 
@@ -2381,7 +2749,7 @@ impl App {
                         self.side_follow = false;
                         self.side_top = (self.side_top as isize + delta).clamp(0, max) as usize;
                     }
-                    (Overlay::None, _) if self.screen == Screen::Decks => {}
+                    (Overlay::None, _) if matches!(self.screen, Screen::Decks | Screen::Quad) => {}
                     (Overlay::None, _) if self.screen == Screen::NowPlaying => {
                         let total = match &self.lyrics {
                             LyricState::Ready(l) => l.lines.len(),
@@ -2483,6 +2851,7 @@ impl App {
                         };
                         self.ensure_lyrics();
                     }
+                    Some((_, Hit::Square(d))) => self.quad_go(d, double),
                     Some((_, Hit::MainPane)) => self.focus = Focus::Main,
                     Some((_, Hit::SidePane)) => self.focus = Focus::Sidebar,
                     _ => {}
@@ -2553,6 +2922,61 @@ impl App {
     pub fn save_settings(&self) {
         if !self.demo {
             self.cfg.save().ok();
+        }
+    }
+}
+
+/// Where a song starts when it goes into a square: past the intro, where
+/// it has got going, so whenever it is picked it comes in with a groove.
+fn start_point(track: &Track) -> u32 {
+    let dur = track.duration_ms;
+    if dur < 90_000 {
+        return 0;
+    }
+    (dur as f32 * 0.28).clamp(25_000.0, (dur - 75_000) as f32) as u32
+}
+
+/// Frames between beats in demo mode (120 BPM at 30 frames a second).
+const DEMO_BEAT: u64 = 15;
+
+/// The squares of demo mode: the same rules as the real ones, kept by a
+/// steady pretend beat.
+#[derive(Default)]
+struct DemoQuad {
+    live: usize,
+    /// The frame the square being heard took over.
+    since: u64,
+    /// A switch on its way: to, how, from which frame, for how many frames.
+    next: Option<(usize, crate::quad::Move, u64, u64)>,
+    paused: bool,
+    stutter_until: u64,
+}
+
+impl DemoQuad {
+    fn go(&mut self, to: usize, slam: bool, frame: u64) {
+        use crate::quad::Move;
+        match self.next {
+            Some((_, _, at, _)) if frame >= at => return,
+            Some(_) if to == self.live => return self.next = None,
+            None if to == self.live => return,
+            _ => {}
+        }
+        let stayed = if self.next.is_some() { 0.0 } else { (frame - self.since) as f64 / DEMO_BEAT as f64 };
+        let mv = crate::quad::choose(stayed, true, slam);
+        let spacing = if mv == Move::Cut { DEMO_BEAT } else { DEMO_BEAT * 4 };
+        let earliest = frame + 4 + if matches!(mv, Move::Roll | Move::Sweep) { DEMO_BEAT / 2 } else { 0 };
+        let at = earliest.div_ceil(spacing) * spacing;
+        let length = if mv == Move::Blend { DEMO_BEAT * 4 } else { 1 };
+        self.next = Some((to, mv, at, length));
+    }
+
+    fn step(&mut self, frame: u64) {
+        if let Some((to, _, at, length)) = self.next {
+            if frame >= at + length {
+                self.live = to;
+                self.since = frame;
+                self.next = None;
+            }
         }
     }
 }
@@ -2812,6 +3236,64 @@ mod tests {
         typed(&mut app, "D");
         assert!(!app.decks_on());
         assert_eq!(app.screen, Screen::Browse);
+    }
+
+    #[test]
+    fn four_takes_four_songs_and_the_arrows_switch_on_the_beat() {
+        let mut app = demo::app(Config::default());
+        app.fixed_step = Some(1.0 / 30.0);
+        key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.screen, Screen::Quad);
+        // What was playing carries on in square 1, with the next songs from the list.
+        let names: Vec<String> = app.squares.squares.iter().map(|s| s.track.as_ref().unwrap().name.clone()).collect();
+        assert_eq!(names, ["Midnight Drive", "Glass Horizon", "Paper Planes at Dawn", "Saltwater"]);
+        assert_eq!(app.crate_songs.front().map(|t| t.name.as_str()), Some("Northern Line"));
+        for _ in 0..70 {
+            app.on_tick();
+        }
+        // Down from square 1 is square 3. Nothing changes until the music says so.
+        key(&mut app, KeyCode::Down);
+        app.on_tick();
+        assert_eq!(app.squares.live, 0);
+        assert_eq!(app.squares.next.map(|n| n.to), Some(2));
+        for _ in 0..200 {
+            app.on_tick();
+            if app.squares.live == 2 {
+                break;
+            }
+        }
+        assert_eq!(app.squares.live, 2, "the switch never landed");
+        assert!(app.squares.next.is_none());
+        // The switch landed on a bar of the demo's beat.
+        let at = app.quad_demo.as_ref().unwrap().since;
+        assert!(app.frame >= at);
+        // Back out to the songs: they keep playing, and enter fills a square.
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, Screen::Browse);
+        assert!(app.quad_on());
+        app.pages[0].tabs[0].sel = 10;
+        key(&mut app, KeyCode::Enter);
+        let filled = app.squares.squares.iter().filter(|s| s.track.as_ref().is_some_and(|t| t.name == "Echo Park")).count();
+        assert_eq!(filled, 1);
+        // Never into the square being heard.
+        assert_ne!(app.squares.squares[2].track.as_ref().unwrap().name, "Echo Park");
+        // 4 brings the squares back; on their screen, 4 turns them off.
+        key(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.screen, Screen::Quad);
+        key(&mut app, KeyCode::Char('4'));
+        assert!(!app.quad_on());
+        assert_eq!(app.screen, Screen::Browse);
+    }
+
+    #[test]
+    fn the_squares_and_the_decks_take_turns() {
+        let mut app = demo::app(Config::default());
+        key(&mut app, KeyCode::Char('4'));
+        assert!(app.quad_on());
+        key(&mut app, KeyCode::Char('D'));
+        assert!(app.decks_on() && !app.quad_on());
+        key(&mut app, KeyCode::Char('4'));
+        assert!(app.quad_on() && !app.decks_on());
     }
 
     #[test]

@@ -263,6 +263,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
+    // The squares take the whole screen, bar the line of key hints.
+    if app.screen == Screen::Quad {
+        let hints = Rect { y: area.bottom() - 1, height: 1, ..area };
+        draw_quad(buf, app, &th, Rect { height: area.height - 1, ..area });
+        draw_hints(buf, app, &th, hints);
+        draw_overlay(buf, app, &th, area);
+        return;
+    }
+
     let bar_h: u16 = if area.height >= 18 { 5 } else { 2 };
     let body = Rect { height: area.height - bar_h - 1, ..area };
     let bar = Rect { y: body.bottom(), height: bar_h, ..area };
@@ -272,8 +281,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::Browse => draw_browse(buf, app, &th, body),
         Screen::NowPlaying => draw_now_playing(buf, app, &th, body),
         Screen::Decks => draw_decks(buf, app, &th, body),
+        Screen::Quad => {}
     }
-    if app.decks_on() {
+    if app.quad_on() {
+        draw_quad_bar(buf, app, &th, bar);
+    } else if app.decks_on() {
         draw_decks_bar(buf, app, &th, bar);
     } else {
         draw_player(buf, app, &th, bar);
@@ -281,96 +293,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_hints(buf, app, &th, hints);
     draw_overlay(buf, app, &th, area);
     if app.party {
-        party(buf, app, &th, area);
-    }
-}
-
-/// Party mode: a pass over the finished frame that makes all of it move with
-/// the music. A spectrum closes in behind everything from all four edges, the
-/// colours wheel round and jump on each beat, the screen flashes on the kick
-/// and rows of text sway. Cover art keeps its own colours.
-fn party(buf: &mut Buffer, app: &App, th: &Theme, area: Rect) {
-    let (w, h) = (area.width as usize, area.height as usize);
-    if w == 0 || h == 0 {
-        return;
-    }
-    let beat = app.beat;
-    let base_hue = app.beats as f32 * 47.0 + app.clock * 28.0;
-    let luma = |c: Color, fallback: f32| match c {
-        Color::Rgb(r, g, b) => (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0,
-        _ => fallback,
-    };
-    let base_luma = luma(rgb(th.bg), 0.05);
-    // Colours are snapped to steps so cells that haven't really changed are
-    // not resent to the terminal on every frame.
-    let step = |v: f32, n: f32| (v * n).round() / n;
-    let band = |t: f32| app.bars[((t * (BANDS - 1) as f32) as usize).min(BANDS - 1)];
-    // How far towards the centre line a full bar gets. Cells are about twice
-    // as tall as they are wide, so the side bars stop sooner to look as deep.
-    const REACH_TALL: f32 = 0.9;
-    const REACH_WIDE: f32 = 0.5;
-
-    for y in 0..h {
-        let row = area.y + y as u16;
-        for x in 0..w {
-            let col = area.x + x as u16;
-            if app.art_rects.iter().any(|r| col >= r.x && col < r.right() && row >= r.y && row < r.bottom()) {
-                continue;
-            }
-            let Some(cell) = buf.cell_mut((col, row)) else { continue };
-            // Bars reach in from all four edges: lows in the middle of each
-            // edge, highs towards the corners. `across` and `down` run from 0
-            // on the centre line to 1 at the edge.
-            let across = ((x as f32 + 0.5) / w as f32 - 0.5).abs() * 2.0;
-            let down = ((y as f32 + 0.5) / h as f32 - 0.5).abs() * 2.0;
-            // How far each cell sits under the tip of the bar covering it,
-            // from the top or bottom edge and from the left or right one.
-            let under = (band(across) * REACH_TALL - (1.0 - down)).max(band(down) * REACH_WIDE - (1.0 - across));
-            let hue = step((base_hue + across.max(down) * 110.0 + across.min(down) * 50.0) / 360.0, 40.0) * 360.0;
-
-            let raised = luma(cell.bg, base_luma) > base_luma + 0.02;
-            let mut light = 0.05 + beat * 0.075;
-            if under > 0.0 {
-                // Brightest just under the tip of each bar.
-                light += 0.07 + 0.11 * (1.0 - under.min(1.0));
-            }
-            if raised {
-                light += 0.07;
-            }
-            let bg = art::hsl_to_rgb(hue, 0.78, step(light.min(0.34), 48.0));
-            cell.set_bg(rgb(bg));
-
-            if cell.symbol() != " " {
-                let strength = luma(cell.fg, 0.9);
-                let fg = if strength > 0.80 {
-                    art::mix((255, 255, 255), art::hsl_to_rgb(hue + 40.0, 1.0, 0.8), 0.18)
-                } else if strength > 0.42 {
-                    art::hsl_to_rgb(hue + 160.0, 0.95, 0.74)
-                } else {
-                    art::hsl_to_rgb(hue + 160.0, 0.7, 0.58)
-                };
-                cell.set_fg(rgb(fg));
-            }
-        }
-    }
-
-    // Sway: rows slide sideways in a travelling wave that kicks on the beat.
-    // The bottom line stays put so the key hints remain readable.
-    if beat > 0.05 {
-        let width = buf.area.width as usize;
-        for y in 0..h.saturating_sub(1) {
-            let shift = ((app.clock * 2.4 + y as f32 * 0.55).sin() * (0.2 + 2.3 * beat)).round() as isize;
-            if shift == 0 {
-                continue;
-            }
-            let start = (area.y as usize + y - buf.area.y as usize) * width;
-            let cells = &mut buf.content[start..start + width];
-            if shift > 0 {
-                cells.rotate_right(shift as usize % width);
-            } else {
-                cells.rotate_left((-shift) as usize % width);
-            }
-        }
+        let music = crate::party::Music { bars: &app.bars, beat: app.beat, beats: app.beats, bass: app.bass, clock: app.clock };
+        crate::party::paint(buf, area, th.bg, &app.art_rects, &app.rave, &music);
     }
 }
 
@@ -1090,6 +1014,183 @@ fn draw_decks_bar(buf: &mut Buffer, app: &mut App, th: &Theme, bar: Rect) {
     }
 }
 
+// ---- four squares ---------------------------------------------------------
+
+/// The four squares, filling `area`: 1 2 above, 3 4 below.
+fn draw_quad(buf: &mut Buffer, app: &mut App, th: &Theme, area: Rect) {
+    let (half_w, half_h) = (area.width / 2, area.height / 2);
+    for d in 0..crate::quad::SQUARES {
+        let (col, row) = ((d % 2) as u16, (d / 2) as u16);
+        let rect = Rect {
+            x: area.x + col * half_w,
+            y: area.y + row * half_h,
+            width: if col == 0 { half_w } else { area.width - half_w },
+            height: if row == 0 { half_h } else { area.height - half_h },
+        };
+        app.hits.push((rect, Hit::Square(d)));
+        draw_square(buf, app, th, rect, d);
+    }
+}
+
+fn draw_square(buf: &mut Buffer, app: &mut App, th: &Theme, rect: Rect, d: usize) {
+    use crate::pop::{self, Look, SCHEMES};
+    use crate::quad::Sync;
+    if rect.width < 4 || rect.height < 2 {
+        return;
+    }
+    let sq = app.squares.squares[d].clone();
+    let next = app.squares.next.filter(|n| n.to == d);
+    let live = app.squares.live == d;
+    let heard = sq.meter.heard.clamp(0.0, 1.0);
+    // Shaking harder as the moment it comes in nears.
+    let coming = match next {
+        Some(n) if n.progress.is_none() => (1.0 - n.beats_left / 4.0).clamp(0.15, 1.0),
+        _ => 0.0,
+    };
+    let look = Look {
+        scheme: d,
+        heard,
+        beat: app.beat * heard,
+        bass: app.bass,
+        time: app.clock,
+        beats: app.beats,
+        coming,
+        picked: app.squares.target() == d,
+    };
+    let cover = sq.track.as_ref().and_then(|t| t.image.clone());
+    let image = cover.as_deref().and_then(|u| app.thumbs.get(u).cloned());
+    if let (Some(url), None) = (&cover, &image) {
+        app.want_image(&url.clone());
+    }
+    let drawn = pop::square(image.as_deref().filter(|_| sq.track.is_some()), rect.width, rect.height, look);
+    for row in 0..drawn.h {
+        for col in 0..drawn.w {
+            let c = drawn.cells[row as usize * drawn.w as usize + col as usize];
+            if let Some(cell) = buf.cell_mut((rect.x + col, rect.y + row)) {
+                cell.set_char(c.ch).set_fg(rgb(c.fg));
+                if let Some(bg) = c.bg {
+                    cell.set_bg(rgb(bg));
+                }
+            }
+        }
+    }
+
+    let s = &SCHEMES[d];
+    let sticker = Style::default().bg(rgb(s.ink)).fg(rgb(s.letter)).add_modifier(Modifier::BOLD);
+    let x = rect.x + 2;
+    let w = rect.width.saturating_sub(4);
+
+    // Top left: the square's number, and what it is up to.
+    let state = match (next, live) {
+        (Some(n), _) if n.progress.is_some() => format!(" {} ▶▶ {} ", d + 1, n.mv.name().to_uppercase()),
+        (Some(n), _) => {
+            let left = n.beats_left.ceil().clamp(1.0, 8.0) as usize;
+            format!(" {} NEXT {} ", d + 1, "●".repeat(left))
+        }
+        (None, true) if app.squares.paused => format!(" {} ❚❚ PAUSED ", d + 1),
+        (None, true) if app.squares.stuttering => format!(" {} ♪ STUTTER ", d + 1),
+        (None, true) => format!(" {} ♪ ON AIR ", d + 1),
+        _ if sq.loading => format!(" {} {} ", d + 1, spinner(app.frame)),
+        _ => format!(" {} ", d + 1),
+    };
+    // Every square's sticker blinks on its own beat: in time, they blink together.
+    let flash = sq.meter.phase.is_some_and(|p| p < 0.15) && !app.squares.paused && next.is_none();
+    let state_style = if flash { Style::default().bg(rgb(s.letter)).fg(rgb(s.ink)).add_modifier(Modifier::BOLD) } else { sticker };
+    put(buf, x, rect.y + 1, w, &state, state_style);
+
+    let Some(track) = sq.track.clone() else {
+        let mid = rect.y + rect.height / 2;
+        put_centered(buf, rect, mid.saturating_sub(1), " EMPTY ", sticker);
+        put_centered(buf, rect, mid + 1, " esc, then enter on a song ", Style::default().bg(rgb(s.paper)).fg(rgb(s.ink)));
+        return;
+    };
+
+    // Top right: the tempo it is running at, and whether it is in time.
+    if rect.width >= 30 {
+        let sync = match sq.meter.sync {
+            _ if live => "",
+            Sync::Locked => " ⇄",
+            Sync::Listening => " …",
+            Sync::Apart => " ≠",
+        };
+        // For the one playing, which beat of the bar it is on: the one is coming.
+        let count = match sq.meter.bar {
+            Some(bar) if live => {
+                let at = (bar * 4.0) as usize;
+                format!(" {}", (0..4).map(|k| if k == at { '●' } else { '○' }).collect::<String>())
+            }
+            _ => String::new(),
+        };
+        if let Some(bpm) = sq.meter.bpm {
+            put_right(buf, rect.right() - 2, rect.y + 1, 20, &format!(" {bpm:.0} BPM{sync}{count} "), sticker);
+        }
+    }
+
+    // The title in a caption box under the cover, the artist under that.
+    let placed = pop::place(rect.width as u32, rect.height as u32 * 2, &look);
+    let under = ((placed.cy + placed.half * 1.3 + 1.0) / 2.0).ceil() as u16;
+    // Leaving the bottom row for how far through the song it is.
+    let y = (rect.y + under).min(rect.bottom().saturating_sub(4)).max(rect.y + 2);
+    let title = format!(" {} ", track.name.to_uppercase());
+    let title_w = (title.width() as u16).min(rect.width.saturating_sub(4));
+    let tx = rect.x + (rect.width.saturating_sub(title_w)) / 2;
+    put(buf, tx, y, title_w, &title, if live { sticker } else { Style::default().bg(rgb(s.ink)).fg(rgb(s.paper)).add_modifier(Modifier::BOLD) });
+    if y + 1 < rect.bottom().saturating_sub(1) {
+        let artist = format!(" {} ", track.artist_line());
+        let aw = (artist.width() as u16).min(rect.width.saturating_sub(6));
+        put(buf, rect.x + (rect.width.saturating_sub(aw)) / 2, y + 1, aw, &artist, Style::default().bg(rgb(s.paper)).fg(rgb(s.ink)));
+    }
+
+    // Along the bottom of the one heard: how far through the song.
+    if live && rect.height >= 8 && track.duration_ms > 0 {
+        let by = rect.bottom() - 2;
+        let bw = rect.width.saturating_sub(6);
+        let filled = ((sq.pos_ms as f64 / track.duration_ms as f64).min(1.0) * bw as f64) as u16;
+        for i in 0..bw {
+            let (ch, color) = if i < filled { ('━', s.ink) } else { ('─', art::mix(s.paper, s.ink, 0.35)) };
+            if let Some(cell) = buf.cell_mut((rect.x + 3 + i, by)) {
+                cell.set_char(ch).set_fg(rgb(color)).set_bg(rgb(s.paper));
+            }
+        }
+    }
+    let _ = th;
+}
+
+/// With the squares on and the songs on screen, the bottom bar shows all four.
+fn draw_quad_bar(buf: &mut Buffer, app: &mut App, th: &Theme, bar: Rect) {
+    use crate::pop::SCHEMES;
+    fill(buf, bar, Style::default().bg(rgb(th.panel)));
+    let compact = bar.height < 5;
+    let x = bar.x + 2;
+    let w = bar.width.saturating_sub(4);
+    let live = app.squares.live;
+    let y = if compact { bar.y } else { bar.y + 1 };
+    if let Some(track) = app.squares.squares[live].track.clone() {
+        let s = &SCHEMES[live];
+        let badge = format!(" {} ♪ ", live + 1);
+        let mut cx = x + put(buf, x, y, 8, &badge, Style::default().bg(rgb(s.paper)).fg(rgb(s.ink)).add_modifier(Modifier::BOLD)) + 1;
+        cx += put(buf, cx, y, w.saturating_sub(40), &track.name, Style::default().fg(th.text).add_modifier(Modifier::BOLD));
+        put(buf, cx, y, (x + w).saturating_sub(cx + 24), &format!(" · {}", track.artist_line()), Style::default().fg(th.dim));
+        let bpm = app.squares.squares[live].meter.bpm.map(|b| format!("{b:.0} BPM  ")).unwrap_or_default();
+        put_right(buf, x + w, y, 22, &format!("{bpm}{}", if app.squares.paused { "paused" } else { "playing" }), Style::default().fg(th.dim));
+    }
+    let y = y + 1 + (!compact) as u16;
+    if y >= bar.bottom() {
+        return;
+    }
+    let each = w / crate::quad::SQUARES as u16;
+    for d in 0..crate::quad::SQUARES {
+        let s = &SCHEMES[d];
+        let sq = &app.squares.squares[d];
+        let cx = x + d as u16 * each;
+        let style = if d == live { Style::default().bg(rgb(s.paper)).fg(rgb(s.ink)) } else { Style::default().fg(rgb(s.paper)) };
+        let coming = app.squares.next.is_some_and(|n| n.to == d);
+        let name = sq.track.as_ref().map_or("empty", |t| t.name.as_str());
+        let label = format!(" {}{} {} ", d + 1, if coming { "▸" } else { "" }, name);
+        put(buf, cx, y, each.saturating_sub(1), &label, style.add_modifier(Modifier::BOLD));
+    }
+}
+
 // ---- player bar -----------------------------------------------------------
 
 fn draw_player(buf: &mut Buffer, app: &mut App, th: &Theme, bar: Rect) {
@@ -1253,6 +1354,18 @@ fn draw_hints(buf: &mut Buffer, app: &mut App, th: &Theme, area: Rect) {
         (Overlay::Search { .. }, _, _) => &[("enter", "search"), ("esc", "cancel")],
         (Overlay::Queue { .. }, _, _) => &[("↑↓", "browse"), ("esc", "close")],
         (Overlay::Devices { .. }, _, _) => &[("enter", "play there"), ("esc", "close")],
+        (_, Screen::Quad, _) => &[
+            ("← → ↑ ↓", "next song"),
+            ("shift+arrow", "drop it"),
+            ("enter", "stutter"),
+            ("tab", "surprise me"),
+            ("space", "pause"),
+            ("esc", "songs"),
+            ("4", "off"),
+        ],
+        (_, Screen::Browse, Focus::Main) if app.quad_on() => {
+            &[("enter", "put in a square"), ("4", "the squares"), ("n p", "next square"), ("/", "search"), ("?", "all keys")]
+        }
         (_, Screen::Decks, _) => {
             &[("a b", "play"), ("← →", "crossfade"), ("m", "mix in"), ("s", "sync"), ("uio jkl", "eq"), ("x", "bass here"), ("tab", "deck"), (",.", "seek"), ("[ ]", "tempo"), ("esc", "songs"), ("D", "off")]
         }
@@ -1382,6 +1495,18 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("s", "match tempo and beat"),
             ("[ ] 0", "tempo down / up / reset"),
             ("{ }", "nudge earlier / later"),
+        ],
+    ),
+    (
+        "Four squares",
+        &[
+            ("4", "four squares (again: off)"),
+            ("← → ↑ ↓", "pick the next song"),
+            ("shift ←→", "drop it: stutter, then in"),
+            ("click", "that square next"),
+            ("enter", "stutter the song playing"),
+            ("tab", "a square chosen for you"),
+            ("enter", "on a song: into a square"),
         ],
     ),
     (
