@@ -294,8 +294,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_hints(buf, app, &th, hints);
     draw_overlay(buf, app, &th, area);
     if app.party {
-        let music = crate::party::Music { bars: &app.bars, beat: app.beat, beats: app.beats, bass: app.bass, clock: app.clock };
-        crate::party::paint(buf, area, th.bg, &app.art_rects, &app.rave, &music);
+        let music = crate::party::Music {
+            bars: &app.bars,
+            beat: app.beat,
+            beats: app.beats,
+            bass: app.bass,
+            clock: app.clock,
+            accent: app.palette.accent,
+            shade: app.palette.shade,
+        };
+        crate::party::paint(buf, area, &app.art_rects, &app.rave, &music);
     }
 }
 
