@@ -71,6 +71,9 @@ pub struct Tempo {
     pub strength: f32,
     /// The last few period readings; their median is what gets reported.
     readings: VecDeque<f32>,
+    /// Leave estimates for the owner to ask for (`due`, `refresh`), so a
+    /// mixer of several decks can run one at a time.
+    pub(crate) on_request: bool,
 }
 
 impl Default for Tempo {
@@ -92,6 +95,7 @@ impl Default for Tempo {
             bar_at: None,
             strength: 0.0,
             readings: VecDeque::with_capacity(8),
+            on_request: false,
         }
     }
 }
@@ -104,8 +108,8 @@ const LOOK: usize = 4;
 impl Tempo {
     /// Forget everything: the audio is about to jump or change speed.
     pub fn reset(&mut self) {
-        let now = self.now;
-        *self = Self { now, ..Self::default() };
+        let (now, on_request) = (self.now, self.on_request);
+        *self = Self { now, on_request, ..Self::default() };
     }
 
     /// Let time pass without audio (the deck is stopped). Both decks' clocks
@@ -174,13 +178,25 @@ impl Tempo {
         self.loud.push_back(loud);
         self.now += 1;
         self.since_estimate += 1;
-        // Re-estimate twice a second once there are four seconds to go on.
-        if self.since_estimate >= (HOPS_PER_SEC / 2.0) as usize
-            && self.onsets.len() >= (HOPS_PER_SEC * 4.0) as usize
-        {
-            self.since_estimate = 0;
-            self.estimate();
+        if !self.on_request && self.due() {
+            self.refresh();
         }
+    }
+
+    /// Whether a new estimate is wanted: twice a second, once there are four
+    /// seconds to go on. Each one takes a few milliseconds.
+    pub(crate) fn due(&self) -> bool {
+        self.since_estimate >= (HOPS_PER_SEC / 2.0) as usize && self.onsets.len() >= (HOPS_PER_SEC * 4.0) as usize
+    }
+
+    /// How overdue an estimate is, in steps.
+    pub(crate) fn waited(&self) -> usize {
+        self.since_estimate
+    }
+
+    pub(crate) fn refresh(&mut self) {
+        self.since_estimate = 0;
+        self.estimate();
     }
 
     fn estimate(&mut self) {
@@ -351,7 +367,8 @@ impl Tempo {
         }
         let mean: [f32; 4] = std::array::from_fn(|k| sums[k] / counts[k] as f32);
         let best = (0..4).max_by(|a, b| mean[*a].total_cmp(&mean[*b])).unwrap_or(0);
-        let keep = self.bar_at.map(|bar| (4 - bar_beat(self.beat_at, bar, period)) % 4);
+        // The place the bar already found has among the four.
+        let keep = self.bar_at.map(|bar| bar_beat(self.beat_at, bar, period));
         let pick = match keep {
             // Loudness is in log terms: this is within about a fifth.
             Some(k) if mean[best] - mean[k] < 0.2 => k,
@@ -1499,30 +1516,43 @@ mod tests {
     fn finds_the_one() {
         // Kick on every beat, and on the first of each four a crash as well.
         for (bpm, offset) in [(120.0, 0.35), (120.0, 1.6), (126.0, 0.1), (98.0, 2.2)] {
-            one_found_at(bpm, offset);
+            // A crash on the one, and then only a slightly harder kick.
+            one_found_at(bpm, offset, 1.2, 1.0);
+            one_found_at(bpm, offset, 0.0, 1.4);
+            // Barely: where holding on to the bar already found matters most.
+            one_found_at(bpm, offset, 0.0, 1.12);
         }
     }
 
-    fn one_found_at(bpm: f64, offset: f64) {
+    fn one_found_at(bpm: f64, offset: f64, crash: f64, harder: f64) {
         let beat = 60.0 / bpm;
         let mut audio = click_track(bpm, offset, 14.0);
         for (i, pair) in audio.chunks_exact_mut(2).enumerate() {
             let t = i as f64 / RATE;
             let into = (t - offset).rem_euclid(beat * 4.0);
             if t >= offset && into < 0.15 {
-                let crash = (((i * 2_654_435_761) % 10_007) as f64 / 10_007.0 - 0.5) * 1.2 * (1.0 - into / 0.15);
-                pair[0] += crash;
-                pair[1] += crash;
+                let hiss = (((i * 2_654_435_761) % 10_007) as f64 / 10_007.0 - 0.5) * crash * (1.0 - into / 0.15);
+                // Within the kick's own length, louder by `harder`.
+                let kick = if into < 0.09 { pair[0] * (harder - 1.0) } else { 0.0 };
+                pair[0] += hiss + kick;
+                pair[1] += hiss + kick;
             }
         }
         let mut tempo = Tempo::default();
+        let mut checked = 0;
         for chunk in audio.chunks(OUT * 2) {
             tempo.feed(chunk);
+            // Right every time it is asked, not just at the end: a bar that
+            // wanders between estimates puts songs a beat or two apart.
+            if let (Some(bar), true) = (tempo.bar_at, tempo.heard() >= 8.0 && tempo.since_estimate == 0) {
+                let off = (bar / HOPS_PER_SEC as f64 - offset).rem_euclid(beat * 4.0);
+                let off = off.min(beat * 4.0 - off);
+                assert!(off < 0.03, "{bpm} BPM from {offset} s (crash {crash}, kick ×{harder}): at {:.1} s the bar starts {off:.3} s from the one", tempo.now as f32 / HOPS_PER_SEC);
+                checked += 1;
+            }
         }
-        let bar = tempo.bar_at.expect("no bar found") / HOPS_PER_SEC as f64;
-        let off = (bar - offset).rem_euclid(beat * 4.0);
-        let off = off.min(beat * 4.0 - off);
-        assert!(off < 0.03, "{bpm} BPM from {offset} s: the bar starts {off:.3} s from the crash");
+        assert!(checked >= 4, "only {checked} estimates checked");
+        assert!(tempo.bar_at.is_some(), "no bar found");
         assert!(tempo.bar_phase().is_some());
     }
 
@@ -1650,5 +1680,48 @@ mod tests {
         let real = pull(&mut feed, &mut mix, 1.0, &mut out);
         assert_eq!(real, 9);
         assert!(out[2 * 9..].iter().all(|v| *v == 0.0));
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn worst_block_with_four_decks() {
+        for staggered in [false, true] {
+            worst_block(staggered);
+        }
+    }
+
+    fn worst_block(staggered: bool) {
+        let audio: Vec<f64> = (0..(RATE * 20.0) as usize)
+            .flat_map(|i| {
+                let t = i as f64 / RATE;
+                let v = if t.rem_euclid(0.5) < 0.08 { (t * 60.0 * std::f64::consts::TAU).sin() * 0.8 } else { 0.0 };
+                [v + ((i * 7919 % 1009) as f64 / 1009.0 - 0.5) * 0.05; 2]
+            })
+            .collect();
+        let mut tempos: Vec<Tempo> = (0..4).map(|_| Tempo::default()).collect();
+        let mut eqs: Vec<Eq> = (0..4).map(|_| Eq::default()).collect();
+        let (mut worst, mut total, mut blocks) = (std::time::Duration::ZERO, std::time::Duration::ZERO, 0u32);
+        for chunk in audio.chunks(OUT * 2) {
+            let started = std::time::Instant::now();
+            for d in 0..4 {
+                let mut block = chunk.to_vec();
+                tempos[d].on_request = staggered;
+                tempos[d].feed(&block);
+                eqs[d].run(&mut block, [0, 0, 0]);
+            }
+            if let Some(t) = tempos.iter_mut().filter(|t| t.due()).max_by_key(|t| t.waited()) {
+                t.refresh();
+            }
+            let took = started.elapsed();
+            worst = worst.max(took);
+            total += took;
+            blocks += 1;
+        }
+        eprintln!("staggered {staggered}: block budget {:.1} ms; mean {:.3} ms, worst {:.1} ms", OUT as f64 / RATE * 1000.0, total.as_secs_f64() * 1000.0 / blocks as f64, worst.as_secs_f64() * 1000.0);
     }
 }
