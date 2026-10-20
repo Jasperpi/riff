@@ -116,7 +116,9 @@ away, and it lands on the beat.
 - Flick between squares and each switch is a cut on the next beat, with
   the old song lifting into it and an echo of it trailing off underneath.
 - A song too far apart in tempo to match is brought in with an echo-out.
-- The square coming in shows **NEXT** and a dot for each beat to go.
+- The square coming in shows **NEXT** and a dot for each beat to go, and
+  the disc where the four squares meet points to it. The disc pulses on the
+  beat.
 
 | | |
 |---|---|
