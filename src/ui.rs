@@ -10,7 +10,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Focus, Hit, LyricState, Overlay, Page, Screen};
+use crate::app::{App, Focus, Hit, LyricState, Overlay, Page, PixelJob, Screen};
 use crate::art::{self, ArtMode, Rgb};
 use crate::engine::Conn;
 use crate::model::*;
@@ -178,7 +178,7 @@ fn draw_art(buf: &mut Buffer, app: &mut App, th: &Theme, area: Rect, url: Option
             if let Some(larger) = art::larger(url) {
                 app.want_image(&larger);
             }
-            app.pixel_jobs.push((cells, url.to_string()));
+            app.pixel_jobs.push((cells, PixelJob::Depth(url.to_string())));
             return;
         }
         let source = app.thumbs.get(url).cloned().unwrap_or(image);
@@ -255,6 +255,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits.clear();
     app.art_rects.clear();
     app.pixel_jobs.clear();
+    app.drawn_squares.clear();
     let buf = f.buffer_mut();
     fill(buf, area, Style::default().bg(rgb(th.bg)).fg(th.text));
 
@@ -1033,8 +1034,29 @@ fn draw_quad(buf: &mut Buffer, app: &mut App, th: &Theme, area: Rect) {
     // Only when the covers gather round the middle, beside their words.
     let beside = crate::pop::layout(half_w, half_h, &crate::pop::Look::default()).beside;
     if beside && app.squares.squares.iter().any(|s| s.track.is_some()) {
-        draw_hub(buf, app, area);
+        if pictures(app) {
+            let (cx, cy) = (area.x as f32 + half_w as f32, (area.y + half_h) as f32);
+            let radius = hub_radius(area, app.beat);
+            // The disc's box, in cells: a pixel is half a row.
+            let (rx, ry) = (radius.ceil() as u16 + 1, (radius / 2.0).ceil() as u16 + 1);
+            let cells = Rect { x: (cx as u16).saturating_sub(rx), y: (cy as u16).saturating_sub(ry), width: rx * 2, height: ry * 2 };
+            let to = app.squares.next.map(|n| n.to);
+            app.pixel_jobs.push((cells, PixelJob::Hub { centre: (cx, cy), radius, to }));
+        } else {
+            draw_hub(buf, app, area);
+        }
     }
+}
+
+/// Whether the squares are drawn with real pictures: in a terminal that
+/// shows them, with nothing popped up that a picture would hide.
+fn pictures(app: &App) -> bool {
+    app.pixels.is_some() && app.cfg.pictures && matches!(app.overlay, Overlay::None | Overlay::Filter)
+}
+
+/// How big the disc where the squares meet is, in pixels (half a row each).
+fn hub_radius(area: Rect, beat: f32) -> f32 {
+    (area.height as f32 * 0.17).clamp(3.5, 6.0) * (1.0 + 0.08 * beat)
 }
 
 fn draw_square(buf: &mut Buffer, app: &mut App, th: &Theme, rect: Rect, d: usize) {
@@ -1061,6 +1083,7 @@ fn draw_square(buf: &mut Buffer, app: &mut App, th: &Theme, rect: Rect, d: usize
         beats: app.beats,
         coming,
         picked: app.squares.target() == d,
+        still: pictures(app),
     };
     let cover = sq.track.as_ref().and_then(|t| t.image.clone());
     let image = cover.as_deref().and_then(|u| app.thumbs.get(u).cloned());
@@ -1078,6 +1101,25 @@ fn draw_square(buf: &mut Buffer, app: &mut App, th: &Theme, rect: Rect, d: usize
                 }
             }
         }
+    }
+    app.drawn_squares.push((rect, look, cover.clone().filter(|_| sq.track.is_some())));
+    // Where the terminal shows pictures, the cover is one, sharp, sent once
+    // the characters are drawn. The cells under it are left plain and
+    // unchanging, so the terminal never has a reason to redraw them.
+    if look.still && image.is_some() && sq.track.is_some() {
+        let (col, row, width, height) = pop::cover_cells(rect.width, rect.height, &look);
+        let cells = Rect { x: rect.x + col, y: rect.y + row, width, height };
+        let s = &crate::pop::SCHEMES[d];
+        fill(buf, cells, Style::default().bg(rgb(s.paper)).fg(rgb(s.paper)));
+        for y in cells.y..cells.bottom() {
+            for x in cells.x..cells.right() {
+                set(buf, x, y, ' ', Style::default().bg(rgb(s.paper)));
+            }
+        }
+        if let Some(larger) = cover.as_deref().and_then(art::larger) {
+            app.want_image(&larger);
+        }
+        app.pixel_jobs.push((cells, PixelJob::Square));
     }
 
     let s = &SCHEMES[d];
@@ -1198,7 +1240,7 @@ fn draw_square(buf: &mut Buffer, app: &mut App, th: &Theme, rect: Rect, d: usize
 /// arrow to the square the music is heading for.
 fn draw_hub(buf: &mut Buffer, app: &App, area: Rect) {
     let (cx, cy) = (area.x as f32 + (area.width / 2) as f32, (area.y + area.height / 2) as f32 * 2.0);
-    let radius = (area.height as f32 * 0.17).clamp(3.5, 6.0) * (1.0 + 0.08 * app.beat);
+    let radius = hub_radius(area, app.beat);
     let ink = (14, 10, 24);
     let ring = art::mix((255, 255, 255), (255, 226, 70), app.beat);
     // Each cell is two pixels: its top in the foreground colour of `▀`, its

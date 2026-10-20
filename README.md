@@ -137,6 +137,11 @@ square finishes, the next one from that list takes its place; a square
 near the end of its song hands over by itself. Back in your songs,
 `enter` puts the song under the cursor into a square.
 
+In a terminal that can show pictures (kitty, Konsole, Ghostty, WezTerm) the
+covers and the disc in the middle are drawn as real pictures, sharp at the
+screen's own resolution; elsewhere, in half-blocks. `pictures = false` in
+the config keeps them to half-blocks.
+
 The squares, like the decks, are local to riff, and they take over from
 the decks (and the decks from them).
 

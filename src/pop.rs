@@ -76,6 +76,9 @@ pub struct Look {
     pub coming: f32,
     /// The square is the one the arrows are on.
     pub picked: bool,
+    /// Keep the cover where it is: no bobbing, no shaking. For a real
+    /// picture, which is only sent again when something really changes.
+    pub still: bool,
 }
 
 /// Where everything goes in a square. Pixels for what is drawn (two to a
@@ -114,8 +117,9 @@ pub fn layout(w: u16, h: u16, look: &Look) -> Layout {
     let beside = wf - full - shadow - MARGIN * 3.0 >= 16.0 && h >= 6;
     // It grows when heard and jumps on the beat; the words stay put.
     let side = full * (0.9 + 0.1 * look.heard) * (1.0 + 0.06 * look.beat * look.heard);
-    let bob = (look.time * 1.7 + look.scheme as f32 * 1.9).sin() * (1.0 - look.heard) * hf * 0.012;
-    let shake = (look.time * 47.0).sin() * look.coming * wf * 0.01;
+    let moves = if look.still { 0.0 } else { 1.0 };
+    let bob = (look.time * 1.7 + look.scheme as f32 * 1.9).sin() * (1.0 - look.heard) * hf * 0.012 * moves;
+    let shake = (look.time * 47.0).sin() * look.coming * wf * 0.01 * moves;
     if !beside {
         // Too narrow: the cover above, the words under it.
         // Clear of the title and artist underneath, and the frame.
@@ -136,11 +140,9 @@ pub fn layout(w: u16, h: u16, look: &Look) -> Layout {
     }
     let inward_right = look.scheme % 2 == 0;
     let cx = if inward_right { wf - MARGIN - shadow - full * 0.5 } else { MARGIN + full * 0.5 };
-    let (text_x, text_end) = if inward_right {
-        (MARGIN, wf - MARGIN * 2.0 - shadow - full)
-    } else {
-        (MARGIN * 2.0 + full + shadow, wf - MARGIN)
-    };
+    // The words keep clear of the cover at its biggest, outline, shadow and all.
+    let (left, right) = cover_reach(cx, full * 0.5);
+    let (text_x, text_end) = if inward_right { (MARGIN, left.floor() - 2.0) } else { (right.ceil() + 2.0, wf - MARGIN) };
     // The number, five dots tall, filling a third of the height, in the
     // outer bottom corner.
     let dot = (hf * 0.3 / 5.0).floor().max(1.0);
@@ -159,6 +161,15 @@ pub fn layout(w: u16, h: u16, look: &Look) -> Layout {
         text_bottom: if numeral.is_some() { room_above } else { h.saturating_sub(1) },
         numeral,
     }
+}
+
+/// The furthest left and right a cover centred at `cx`, `full_half` pixels
+/// from middle to edge when heard, ever reaches: on the beat, with its
+/// outline and its longest shadow.
+fn cover_reach(cx: f32, full_half: f32) -> (f32, f32) {
+    let half = full_half * 1.06;
+    let ring = if half > 12.0 { 2.0 } else { 1.0 };
+    (cx - half - ring, cx + half + ring + shadow_for(half) * 1.4)
 }
 
 /// How far a cover's shadow falls, for a cover `half` pixels from middle to edge.
@@ -197,117 +208,275 @@ pub fn square(cover: Option<&RgbImage>, w: u16, h: u16, look: Look) -> Rendered 
 
 /// The square as pixels, row by row: `w` by `h` of them, two to a cell.
 pub fn picture(cover: Option<&RgbImage>, w: u32, h: u32, look: &Look) -> Vec<Rgb> {
-    let s = &SCHEMES[look.scheme % SCHEMES.len()];
-    let at = layout(w as u16, (h / 2) as u16, look);
-    let shadow = shadow_for(at.half) * (1.0 + 0.4 * look.beat * look.heard);
-    let outline = if at.half > 12.0 { 2.0 } else { 1.0 };
-    let print = cover.map(|c| Print::new(c, s));
-    let (wf, hf) = (w as f32, h as f32);
-
-    // The corner nearest the middle of the screen: the halftone fades out
-    // towards it and grows towards the outer edges.
-    let inner = (if look.scheme % 2 == 0 { wf } else { 0.0 }, if look.scheme < 2 { hf } else { 0.0 });
-    let reach = (wf * wf + hf * hf).sqrt();
-    // A spotlight behind the cover being heard: rays that turn slowly and
-    // kick round a notch on each beat.
-    let rays = 16.0;
-    let notch = std::f32::consts::TAU / rays * 0.5;
-    let kick = (look.beats % 2) as f32 + (1.0 - look.beat).powi(3);
-    let spin = look.time * 0.05 + notch * kick;
-    let spot = look.heard;
-    let dots = mix(s.paper, s.dots, 0.75);
-
-    let mut out = vec![s.paper; (w * h) as usize];
+    let painter = Painter::new(cover, w as u16, (h / 2) as u16, *look);
+    let mut out = Vec::with_capacity((w * h) as usize);
     for y in 0..h {
         for x in 0..w {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let (dx, dy) = (fx - at.cx, fy - at.cy);
-            // Position on the cover's own square: -1..1 inside.
-            let local = |ox: f32, oy: f32| ((dx - ox) / at.half, (dy - oy) / at.half);
-            let inside = |(u, v): (f32, f32), grow: f32| u.abs() <= 1.0 + grow && v.abs() <= 1.0 + grow;
-            let has_cover = cover.is_some();
-
-            let (u, v) = local(0.0, 0.0);
-            let colour = if has_cover && inside((u, v), 0.0) {
-                print.as_ref().map_or(s.paper, |p| p.colour(u, v, look.heard, s))
-            } else if has_cover && inside((u, v), outline / at.half) {
-                s.ink
-            } else if has_cover && inside(local(shadow, shadow), outline / at.half) {
-                s.ink
-            } else {
-                let mut page = s.paper;
-                if spot > 0.0 {
-                    let angle = dy.atan2(dx) + spin;
-                    if (angle / std::f32::consts::TAU * rays).rem_euclid(1.0) < 0.5 {
-                        page = mix(page, s.letter, 0.3 * spot);
-                    }
-                }
-                // A halftone screen: dots on a regular grid, every other row
-                // shifted, none near the middle of the screen and growing a
-                // size at a time towards the outer corner (and with the bass,
-                // while heard). Whole pixels, so the screen stays crisp.
-                let (gx, gy) = (x as i32, y as i32);
-                let row = gy.div_euclid(4);
-                let shift = if row % 2 == 0 { 0 } else { 2 };
-                let (ox, oy) = ((gx + shift).rem_euclid(4), gy.rem_euclid(4));
-                let far = ((fx - inner.0).powi(2) + (fy - inner.1).powi(2)).sqrt() / reach;
-                let size = ((far * 1.5 - 0.35 + 0.15 * look.bass * spot) * 3.0).clamp(0.0, 3.0) as i32;
-                let on = match size {
-                    1 => ox == 1 && oy == 1,
-                    2 => (1..=2).contains(&ox) && oy == 1,
-                    3 => (1..=2).contains(&ox) && (1..=2).contains(&oy),
-                    _ => false,
-                };
-                if on {
-                    page = dots;
-                }
-                page
-            };
-            out[(y * w + x) as usize] = colour;
-        }
-    }
-
-    // The big number, with a hard shadow like the cover's.
-    if let Some((nx, ny, dot)) = at.numeral {
-        let fill = if look.heard > 0.5 { s.letter } else { s.tones[3] };
-        let n = look.scheme;
-        let ink_at = |px: f32, py: f32| digit_dot(n, ((px - nx) / dot).floor() as i32, ((py - ny) / dot).floor() as i32);
-        let fall = (dot * 0.5).max(1.0);
-        for y in ny.max(0.0) as u32..((ny + dot * 5.0 + fall + 1.0) as u32).min(h) {
-            for x in nx.max(0.0) as u32..((nx + dot * 3.0 + fall + 1.0) as u32).min(w) {
-                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                if ink_at(px, py) {
-                    out[(y * w + x) as usize] = fill;
-                } else if ink_at(px - fall, py - fall) {
-                    out[(y * w + x) as usize] = s.ink;
-                }
-            }
-        }
-    }
-
-    // A frame round the square: ink, or for the one heard, light that
-    // flashes on the beat; for one coming in, a blink on each half beat.
-    let frame = if look.heard > 0.5 {
-        Some(mix((255, 255, 255), s.letter, 0.5 - 0.5 * look.beat))
-    } else if look.coming > 0.0 && (look.time * 4.0).fract() < 0.5 {
-        Some(s.letter)
-    } else if look.picked {
-        Some(s.letter)
-    } else {
-        None
-    };
-    let thick = if look.heard > 0.5 || look.coming > 0.0 { 2 } else { 1 };
-    for y in 0..h {
-        for x in 0..w {
-            let edge = x < thick || x + thick >= w || y < thick || y + thick >= h;
-            // The outermost line stays ink, so neighbouring frames never run together.
-            let rim = x == 0 || x + 1 == w || y == 0 || y + 1 == h;
-            if edge {
-                out[(y * w + x) as usize] = if rim { s.ink } else { frame.unwrap_or(s.ink) };
-            }
+            out.push(painter.paint(x as f32 + 0.5, y as f32 + 0.5, false));
         }
     }
     out
+}
+
+/// Everything about a square worked out once, to paint it at any point:
+/// on the grid of half-block pixels, or finer, for a real picture.
+pub struct Painter<'a> {
+    s: &'static Scheme,
+    look: Look,
+    at: Layout,
+    shadow: f32,
+    outline: f32,
+    print: Option<Print<'a>>,
+    w: f32,
+    h: f32,
+    /// The corner nearest the middle of the screen: the halftone fades out
+    /// towards it and grows towards the outer edges.
+    inner: (f32, f32),
+    reach: f32,
+    spin: f32,
+    dots: Rgb,
+    frame: Option<Rgb>,
+    thick: f32,
+}
+
+impl<'a> Painter<'a> {
+    /// The square of `w` by `h` cells. A finer picture of the cover should
+    /// be given when there is one: only the cover is drawn finer.
+    pub fn new(cover: Option<&'a RgbImage>, w: u16, h: u16, look: Look) -> Self {
+        let s = &SCHEMES[look.scheme % SCHEMES.len()];
+        let at = layout(w, h, &look);
+        let (wf, hf) = (w as f32, h as f32 * 2.0);
+        // A spotlight behind the cover being heard: rays that turn slowly and
+        // kick round a notch on each beat.
+        let notch = std::f32::consts::TAU / RAYS * 0.5;
+        let kick = (look.beats % 2) as f32 + (1.0 - look.beat).powi(3);
+        // A frame round the square: ink, or for the one heard, light that
+        // flashes on the beat; for one coming in, a blink on each half beat.
+        let frame = if look.heard > 0.5 {
+            Some(mix((255, 255, 255), s.letter, 0.5 - 0.5 * look.beat))
+        } else if look.coming > 0.0 && (look.time * 4.0).fract() < 0.5 {
+            Some(s.letter)
+        } else if look.picked {
+            Some(s.letter)
+        } else {
+            None
+        };
+        Self {
+            s,
+            look,
+            at,
+            shadow: shadow_for(at.half) * (1.0 + 0.4 * look.beat * look.heard),
+            outline: if at.half > 12.0 { 2.0 } else { 1.0 },
+            print: cover.map(Print::new),
+            w: wf,
+            h: hf,
+            inner: (if look.scheme % 2 == 0 { wf } else { 0.0 }, if look.scheme < 2 { hf } else { 0.0 }),
+            reach: (wf * wf + hf * hf).sqrt(),
+            spin: look.time * 0.05 + notch * kick,
+            dots: mix(s.paper, s.dots, 0.75),
+            frame,
+            thick: if look.heard > 0.5 || look.coming > 0.0 { 2.0 } else { 1.0 },
+        }
+    }
+
+    /// The colour at `x`, `y`, in half-block pixels from the square's top
+    /// left. The frame, the number and the page behind are drawn in whole
+    /// pixels wherever they are asked for, so a fine picture matches the
+    /// half-blocks round it exactly; the cover, its outline and its shadow
+    /// are drawn as finely as they are asked for (`fine` also reads the
+    /// cover between its pixels).
+    pub fn paint(&self, x: f32, y: f32, fine: bool) -> Rgb {
+        let (s, look, at) = (self.s, &self.look, &self.at);
+        let (px, py) = (x.floor(), y.floor());
+        // The frame: the outermost line always ink, so neighbouring frames
+        // never run together.
+        let edge = px < self.thick || px + self.thick >= self.w || py < self.thick || py + self.thick >= self.h;
+        if edge {
+            let rim = px < 1.0 || px + 1.0 >= self.w || py < 1.0 || py + 1.0 >= self.h;
+            return if rim { s.ink } else { self.frame.unwrap_or(s.ink) };
+        }
+        // The big number, with a hard shadow like the cover's.
+        if let Some((nx, ny, dot)) = at.numeral {
+            let (cx, cy) = (px + 0.5, py + 0.5);
+            let ink_at = |qx: f32, qy: f32| digit_dot(look.scheme, ((qx - nx) / dot).floor() as i32, ((qy - ny) / dot).floor() as i32);
+            let fall = (dot * 0.5).max(1.0);
+            if ink_at(cx, cy) {
+                return if look.heard > 0.5 { s.letter } else { s.tones[3] };
+            }
+            if ink_at(cx - fall, cy - fall) {
+                return s.ink;
+            }
+        }
+        // The cover, its outline and its shadow.
+        let (fx, fy) = if fine { (x, y) } else { (px + 0.5, py + 0.5) };
+        if let Some(print) = &self.print {
+            let (dx, dy) = (fx - at.cx, fy - at.cy);
+            let (u, v) = (dx / at.half, dy / at.half);
+            let ring = self.outline / at.half;
+            if u.abs() <= 1.0 && v.abs() <= 1.0 {
+                return print.colour(u, v, look.heard, s, fine);
+            }
+            let (su, sv) = ((dx - self.shadow) / at.half, (dy - self.shadow) / at.half);
+            let within = |u: f32, v: f32| u.abs() <= 1.0 + ring && v.abs() <= 1.0 + ring;
+            if within(u, v) || within(su, sv) {
+                return s.ink;
+            }
+        }
+        self.page(px, py)
+    }
+
+    /// The page behind everything at whole pixel `px`, `py`.
+    fn page(&self, px: f32, py: f32) -> Rgb {
+        let (s, look, at) = (self.s, &self.look, &self.at);
+        let (cx, cy) = (px + 0.5, py + 0.5);
+        let mut page = s.paper;
+        let spot = look.heard;
+        if spot > 0.0 {
+            let angle = (cy - at.cy).atan2(cx - at.cx) + self.spin;
+            if (angle / std::f32::consts::TAU * RAYS).rem_euclid(1.0) < 0.5 {
+                page = mix(page, s.letter, 0.3 * spot);
+            }
+        }
+        // A halftone screen: dots on a regular grid, every other row
+        // shifted, none near the middle of the screen and growing a size at
+        // a time towards the outer corner (and with the bass, while heard).
+        // Whole pixels, so the screen stays crisp.
+        let (gx, gy) = (px as i32, py as i32);
+        let shift = if gy.div_euclid(4) % 2 == 0 { 0 } else { 2 };
+        let (ox, oy) = ((gx + shift).rem_euclid(4), gy.rem_euclid(4));
+        let far = ((cx - self.inner.0).powi(2) + (cy - self.inner.1).powi(2)).sqrt() / self.reach;
+        let size = ((far * 1.5 - 0.35 + 0.15 * look.bass * spot) * 3.0).clamp(0.0, 3.0) as i32;
+        let on = match size {
+            1 => ox == 1 && oy == 1,
+            2 => (1..=2).contains(&ox) && oy == 1,
+            3 => (1..=2).contains(&ox) && (1..=2).contains(&oy),
+            _ => false,
+        };
+        if on { self.dots } else { page }
+    }
+}
+
+/// Rays in the spotlight behind the cover being heard.
+const RAYS: f32 = 16.0;
+
+/// The cells a square's cover takes up, with its outline and its shadow, at
+/// the most it ever grows (when heard, on the beat): where a real picture of
+/// it goes. Relative to the square: column, row, width, height.
+pub fn cover_cells(w: u16, h: u16, look: &Look) -> (u16, u16, u16, u16) {
+    let biggest = Look { heard: 1.0, beat: 1.0, ..*look };
+    let at = layout(w, h, &biggest);
+    let reach = at.half + if at.half > 12.0 { 2.0 } else { 1.0 };
+    let shadow = shadow_for(at.half) * 1.4;
+    let (left, right) = ((at.cx - reach).floor().max(1.0), (at.cx + reach + shadow).ceil().min(w as f32 - 1.0));
+    let (top, bottom) = (((at.cy - reach) / 2.0).floor().max(1.0), ((at.cy + reach + shadow) / 2.0).ceil().min(h as f32 - 1.0));
+    (left as u16, top as u16, (right - left).max(0.0) as u16, (bottom - top).max(0.0) as u16)
+}
+
+/// The disc where the squares meet, for a real picture of it.
+#[derive(Clone, Copy, Debug)]
+pub struct Hub {
+    /// Its middle in cells: columns across, rows down.
+    pub centre: (f32, f32),
+    /// Its radius in half-block pixels (a column wide, half a row tall).
+    pub radius: f32,
+    /// The square the music is heading for, to point at.
+    pub to: Option<usize>,
+    pub beat: f32,
+}
+
+impl Hub {
+    pub const INK: Rgb = (14, 10, 24);
+
+    pub fn ring(&self) -> Rgb {
+        mix((255, 255, 255), (255, 226, 70), self.beat)
+    }
+
+    /// Its colour `dx`, `dy` half-block pixels from its middle, if it covers that point.
+    fn paint(&self, dx: f32, dy: f32) -> Option<Rgb> {
+        let r = (dx * dx + dy * dy).sqrt();
+        let (outer, band) = (self.radius, 1.5);
+        if r > outer + 1.0 {
+            return None;
+        }
+        if r > outer || r > outer - band {
+            return Some(if r > outer { Self::INK } else { self.ring() });
+        }
+        // Inside: an arrow to the square coming in, or a dot that pulses.
+        let inside = match self.to {
+            Some(to) => {
+                let dir = [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)][to % 4];
+                let (ux, uy) = (dir.0 * std::f32::consts::FRAC_1_SQRT_2, dir.1 * std::f32::consts::FRAC_1_SQRT_2);
+                let along = dx * ux + dy * uy;
+                let across = (dx * uy - dy * ux).abs();
+                let size = outer - band;
+                let head = (0.0..size * 0.6).contains(&along) && across <= (size * 0.6 - along) * 0.75;
+                let shaft = (-size * 0.55..0.05).contains(&along) && across <= size * 0.14;
+                head || shaft
+            }
+            None => r <= (outer - band) * (0.25 + 0.15 * self.beat),
+        };
+        Some(if inside { self.ring() } else { Self::INK })
+    }
+}
+
+/// A real picture of part of the four squares: the cells `cells`, at `w` by
+/// `h` pixels of RGB, with the disc where they meet over them if given.
+/// Each point is painted by whichever square it falls in.
+pub fn scene(squares: &[(ratatui::layout::Rect, Painter)], hub: Option<&Hub>, cells: ratatui::layout::Rect, w: u32, h: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (w * h * 3) as usize];
+    let paint_row = |y: usize, line: &mut [u8]| {
+        let row = cells.y as f32 + (y as f32 + 0.5) / h as f32 * cells.height as f32;
+        for (x, pixel) in line.chunks_exact_mut(3).enumerate() {
+            let col = cells.x as f32 + (x as f32 + 0.5) / w as f32 * cells.width as f32;
+            let disc = hub.and_then(|hub| hub.paint(col - hub.centre.0, (row - hub.centre.1) * 2.0));
+            let colour = disc.or_else(|| {
+                squares
+                    .iter()
+                    .find(|(r, _)| col >= r.x as f32 && col < r.right() as f32 && row >= r.y as f32 && row < r.bottom() as f32)
+                    .map(|(r, painter)| painter.paint(col - r.x as f32, (row - r.y as f32) * 2.0, true))
+            });
+            let c = colour.unwrap_or(Hub::INK);
+            pixel.copy_from_slice(&[c.0, c.1, c.2]);
+        }
+    };
+    // Rows dealt out between a few threads in turn.
+    let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4);
+    let mut hands: Vec<Vec<(usize, &mut [u8])>> = (0..threads).map(|_| Vec::new()).collect();
+    for (y, line) in out.chunks_mut((w * 3) as usize).enumerate() {
+        hands[y % threads].push((y, line));
+    }
+    std::thread::scope(|scope| {
+        for hand in hands {
+            let paint_row = &paint_row;
+            scope.spawn(move || {
+                for (y, line) in hand {
+                    paint_row(y, line);
+                }
+            });
+        }
+    });
+    out
+}
+
+/// What a square's picture depends on, in steps coarse enough that it is
+/// sent again only when the change would show.
+pub fn look_key(look: &Look) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let step = |v: f32, n: f32| (v * n).round() as i32;
+    look.scheme.hash(&mut h);
+    step(look.heard, 10.0).hash(&mut h);
+    look.picked.hash(&mut h);
+    (look.coming > 0.0 && (look.time * 4.0).fract() < 0.5).hash(&mut h);
+    (look.coming > 0.0).hash(&mut h);
+    if look.heard > 0.0 {
+        // The one heard jumps on the beat, and its spotlight turns.
+        step(look.beat * look.heard, 6.0).hash(&mut h);
+        step(look.bass * look.heard, 4.0).hash(&mut h);
+        (look.beats % 2).hash(&mut h);
+        step(look.time, 8.0).hash(&mut h);
+    }
+    h.finish()
 }
 
 /// A cover ready to print: its colours, and how its lightness spreads, so
@@ -319,7 +488,7 @@ struct Print<'a> {
 }
 
 impl<'a> Print<'a> {
-    fn new(img: &'a RgbImage, _s: &Scheme) -> Self {
+    fn new(img: &'a RgbImage) -> Self {
         // Every eighth pixel each way is plenty to find the range.
         let (mut lo, mut hi) = (1f32, 0f32);
         for y in (0..img.height()).step_by(8) {
@@ -334,11 +503,26 @@ impl<'a> Print<'a> {
 
     /// The cover's colour at `u`, `v` (-1..1 across it): printed in the
     /// scheme's inks, or as itself made louder, by how much it is `heard`.
-    fn colour(&self, u: f32, v: f32, heard: f32, s: &Scheme) -> Rgb {
+    /// `fine` reads between the cover's pixels, for a real picture.
+    fn colour(&self, u: f32, v: f32, heard: f32, s: &Scheme, fine: bool) -> Rgb {
         let (w, h) = (self.img.width(), self.img.height());
-        let x = (((u + 1.0) * 0.5 * w as f32) as u32).min(w - 1);
-        let y = (((v + 1.0) * 0.5 * h as f32) as u32).min(h - 1);
-        let p = self.img.get_pixel(x, y).0;
+        let p = if fine {
+            let x = ((u + 1.0) * 0.5 * w as f32 - 0.5).clamp(0.0, w as f32 - 1.0);
+            let y = ((v + 1.0) * 0.5 * h as f32 - 0.5).clamp(0.0, h as f32 - 1.0);
+            let (x0, y0) = (x as u32, y as u32);
+            let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+            let (tx, ty) = (x - x0 as f32, y - y0 as f32);
+            let (a, b, c, d) = (self.img.get_pixel(x0, y0).0, self.img.get_pixel(x1, y0).0, self.img.get_pixel(x0, y1).0, self.img.get_pixel(x1, y1).0);
+            std::array::from_fn(|i| {
+                let top = a[i] as f32 + (b[i] as f32 - a[i] as f32) * tx;
+                let bottom = c[i] as f32 + (d[i] as f32 - c[i] as f32) * tx;
+                (top + (bottom - top) * ty) as u8
+            })
+        } else {
+            let x = (((u + 1.0) * 0.5 * w as f32) as u32).min(w - 1);
+            let y = (((v + 1.0) * 0.5 * h as f32) as u32).min(h - 1);
+            self.img.get_pixel(x, y).0
+        };
         let l = ((lightness(p) - self.lo) / self.span).clamp(0.0, 1.0);
         let printed = s.tones[((l * 4.0) as usize).min(3)];
         if heard <= 0.0 {
@@ -439,6 +623,10 @@ mod tests {
                 assert!(at.cy - at.half >= 1.0 && at.cy + at.half <= h as f32 * 2.0 - 1.0, "{w}x{h} #{scheme}: cover off the top or bottom");
                 let (tx, te) = (at.text_x as f32, (at.text_x + at.text_w) as f32);
                 assert!(te <= left || tx >= right, "{w}x{h} #{scheme}: words {tx}..{te} over the cover {left}..{right}");
+                // Nor under the real picture of the cover, which allows for it at its biggest.
+                let (col, _, width, _) = cover_cells(w, h, &look);
+                let (pl, pr) = (col, col + width);
+                assert!(at.text_x + at.text_w <= pl || at.text_x >= pr, "{w}x{h} #{scheme}: words {tx}..{te} under the picture {pl}..{pr}");
                 assert!(at.text_w >= 14);
                 if let Some((nx, ny, dot)) = at.numeral {
                     assert!(nx >= 1.0 && nx + dot * 4.0 <= w as f32 && ny >= 1.0 && ny + dot * 6.0 <= h as f32 * 2.0, "{w}x{h} #{scheme}: number off the square");
@@ -450,6 +638,45 @@ mod tests {
         let at = layout(30, 14, &Look::default());
         assert!(!at.beside);
         assert!(at.cy + at.half <= at.text_top as f32 * 2.0, "the words run into the cover");
+    }
+
+    #[test]
+    fn a_fine_picture_matches_the_cells_round_it() {
+        // Outside the cover's own box, painting finely gives just what the
+        // half-block pixel there shows: the edge of a picture never shows.
+        for look in [Look::default(), Look { scheme: 1, heard: 1.0, beat: 0.6, bass: 0.5, time: 3.0, beats: 5, ..Default::default() }] {
+            let (w, h) = (60u16, 17u16);
+            let img = cover();
+            let painter = Painter::new(Some(&img), w, h, look);
+            let (col, row, width, height) = cover_cells(w, h, &look);
+            for py in 0..h as u32 * 2 {
+                for px in 0..w as u32 {
+                    let in_box = (col as u32..(col + width) as u32).contains(&px) && (row as u32 * 2..(row + height) as u32 * 2).contains(&py);
+                    if in_box {
+                        continue;
+                    }
+                    let coarse = painter.paint(px as f32 + 0.5, py as f32 + 0.5, false);
+                    for (sx, sy) in [(0.05, 0.05), (0.95, 0.1), (0.3, 0.9), (0.99, 0.99)] {
+                        let fine = painter.paint(px as f32 + sx, py as f32 + sy, true);
+                        assert_eq!(fine, coarse, "at {px}+{sx}, {py}+{sy}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pictures_are_sent_again_only_when_they_change() {
+        let idle = Look { scheme: 2, time: 1.0, bass: 0.7, beat: 0.9, ..Default::default() };
+        // A square not being heard looks the same whatever the music does.
+        assert_eq!(look_key(&idle), look_key(&Look { time: 9.3, bass: 0.1, beat: 0.0, beats: 7, ..idle }));
+        // Being picked, or coming in (and its blink), shows.
+        assert_ne!(look_key(&idle), look_key(&Look { picked: true, ..idle }));
+        assert_ne!(look_key(&Look { coming: 0.5, time: 1.0, ..idle }), look_key(&Look { coming: 0.5, time: 1.15, ..idle }));
+        // The one heard changes with the beat, but not with every twitch of it.
+        let heard = Look { heard: 1.0, ..idle };
+        assert_ne!(look_key(&heard), look_key(&Look { beat: 0.2, ..heard }));
+        assert_eq!(look_key(&heard), look_key(&Look { beat: 0.91, ..heard }));
     }
 
     #[test]
@@ -467,5 +694,26 @@ mod tests {
         let (rim, inside) = at(Look::default());
         assert_eq!(rim, SCHEMES[0].ink);
         assert!(!light(inside), "{inside:?}");
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn a_cover_picture_takes() {
+        let img = RgbImage::from_fn(640, 640, |x, y| image::Rgb([(x / 3) as u8, (y / 3) as u8, 90]));
+        let look = Look { heard: 1.0, beat: 0.5, still: true, ..Default::default() };
+        let rect = ratatui::layout::Rect::new(0, 0, 80, 22);
+        let painters = vec![(rect, Painter::new(Some(&img), 80, 22, look))];
+        let (col, row, w, h) = cover_cells(80, 22, &look);
+        let cells = ratatui::layout::Rect::new(col, row, w, h);
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            std::hint::black_box(scene(&painters, None, cells, w as u32 * 9, h as u32 * 18));
+        }
+        eprintln!("{}x{} cells at 9x18: {:.1} ms each", w, h, started.elapsed().as_secs_f32() * 1000.0 / 20.0);
     }
 }

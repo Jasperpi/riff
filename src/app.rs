@@ -55,6 +55,18 @@ pub enum Overlay {
     Devices { sel: usize },
 }
 
+/// What a real picture on screen shows.
+#[derive(Clone, Debug)]
+pub enum PixelJob {
+    /// A cover with depth.
+    Depth(String),
+    /// Part of the squares: a cover, and round it.
+    Square,
+    /// The disc where the squares meet: its middle and radius in cells
+    /// (columns across, rows down), and the square it points to.
+    Hub { centre: (f32, f32), radius: f32, to: Option<usize> },
+}
+
 /// Something on screen that reacts to the mouse.
 #[derive(Clone, Debug)]
 pub enum Hit {
@@ -244,7 +256,10 @@ pub struct App {
     /// The terminal's way of showing real pictures, when it has one, and the
     /// covers to be shown that way this frame: which cells, which cover.
     pub pixels: Option<crate::pixels::Screen>,
-    pub pixel_jobs: Vec<(Rect, String)>,
+    pub pixel_jobs: Vec<(Rect, PixelJob)>,
+    /// The squares as drawn this frame, for pictures of them: where each
+    /// is, how it looks, and its cover.
+    pub drawn_squares: Vec<(Rect, crate::pop::Look, Option<String>)>,
     pub art_cache: HashMap<(String, u16, u16, ArtMode), Arc<Rendered>>,
     pub palette: Palette,
     palette_target: Palette,
@@ -383,6 +398,7 @@ impl App {
             art_mode,
             pixels: None,
             pixel_jobs: Vec::new(),
+            drawn_squares: Vec::new(),
             art_cache: HashMap::new(),
             palette: Palette::default(),
             palette_target: Palette::default(),
