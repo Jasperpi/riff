@@ -1030,6 +1030,11 @@ fn draw_quad(buf: &mut Buffer, app: &mut App, th: &Theme, area: Rect) {
         app.hits.push((rect, Hit::Square(d)));
         draw_square(buf, app, th, rect, d);
     }
+    // Only when the covers gather round the middle, beside their words.
+    let beside = crate::pop::layout(half_w, half_h, &crate::pop::Look::default()).beside;
+    if beside && app.squares.squares.iter().any(|s| s.track.is_some()) {
+        draw_hub(buf, app, area);
+    }
 }
 
 fn draw_square(buf: &mut Buffer, app: &mut App, th: &Theme, rect: Rect, d: usize) {
@@ -1077,83 +1082,168 @@ fn draw_square(buf: &mut Buffer, app: &mut App, th: &Theme, rect: Rect, d: usize
 
     let s = &SCHEMES[d];
     let sticker = Style::default().bg(rgb(s.ink)).fg(rgb(s.letter)).add_modifier(Modifier::BOLD);
-    let x = rect.x + 2;
-    let w = rect.width.saturating_sub(4);
-
-    // Top left: the square's number, and what it is up to.
-    let state = match (next, live) {
-        (Some(n), _) if n.progress.is_some() => format!(" {} ▶▶ {} ", d + 1, n.mv.name().to_uppercase()),
-        (Some(n), _) => {
-            let left = n.beats_left.ceil().clamp(1.0, 8.0) as usize;
-            format!(" {} NEXT {} ", d + 1, "●".repeat(left))
-        }
-        (None, true) if app.squares.paused => format!(" {} ❚❚ PAUSED ", d + 1),
-        (None, true) if app.squares.stuttering => format!(" {} ♪ STUTTER ", d + 1),
-        (None, true) => format!(" {} ♪ ON AIR ", d + 1),
-        _ if sq.loading => format!(" {} {} ", d + 1, spinner(app.frame)),
-        _ => format!(" {} ", d + 1),
+    let plain = Style::default().bg(rgb(s.paper)).fg(rgb(s.ink));
+    let at = pop::layout(rect.width, rect.height, &look);
+    let (tx, tw) = (rect.x + at.text_x, at.text_w);
+    // Beside the cover the words line up against it, so the four covers and
+    // their titles make one picture; under it, they are centred.
+    let towards_right = at.beside && d % 2 == 0;
+    let line = |buf: &mut Buffer, y: u16, text: &str, style: Style| {
+        let text = fit(text, tw as usize);
+        let used = text.width() as u16;
+        let x = if !at.beside { tx + tw.saturating_sub(used) / 2 } else if towards_right { tx + tw - used } else { tx };
+        put(buf, x, y, used, &text, style);
     };
-    // Every square's sticker blinks on its own beat: in time, they blink together.
-    let flash = sq.meter.phase.is_some_and(|p| p < 0.15) && !app.squares.paused && next.is_none();
-    let state_style = if flash { Style::default().bg(rgb(s.letter)).fg(rgb(s.ink)).add_modifier(Modifier::BOLD) } else { sticker };
-    put(buf, x, rect.y + 1, w, &state, state_style);
 
     let Some(track) = sq.track.clone() else {
         let mid = rect.y + rect.height / 2;
         put_centered(buf, rect, mid.saturating_sub(1), " EMPTY ", sticker);
-        put_centered(buf, rect, mid + 1, " esc, then enter on a song ", Style::default().bg(rgb(s.paper)).fg(rgb(s.ink)));
+        put_centered(buf, rect, mid + 1, " esc, then enter on a song ", plain);
         return;
     };
 
-    // Top right: the tempo it is running at, and whether it is in time.
-    if rect.width >= 30 {
-        let sync = match sq.meter.sync {
-            _ if live => "",
-            Sync::Locked => " ⇄",
-            Sync::Listening => " …",
-            Sync::Apart => " ≠",
-        };
-        // For the one playing, which beat of the bar it is on: the one is coming.
-        let count = match sq.meter.bar {
-            Some(bar) if live => {
-                let at = (bar * 4.0) as usize;
-                format!(" {}", (0..4).map(|k| if k == at { '●' } else { '○' }).collect::<String>())
-            }
-            _ => String::new(),
-        };
-        if let Some(bpm) = sq.meter.bpm {
-            put_right(buf, rect.right() - 2, rect.y + 1, 20, &format!(" {bpm:.0} BPM{sync}{count} "), sticker);
+    // What it is up to. Beside the cover the big number says which square it is.
+    let number = if at.numeral.is_some() { String::new() } else { format!("{} ", d + 1) };
+    let state = match (next, live) {
+        (Some(n), _) if n.progress.is_some() => format!(" {number}▶▶ {} ", n.mv.name().to_uppercase()),
+        (Some(n), _) => {
+            let left = n.beats_left.ceil().clamp(1.0, 8.0) as usize;
+            format!(" {number}NEXT {} ", "●".repeat(left))
+        }
+        (None, true) if app.squares.paused => format!(" {number}❚❚ PAUSED "),
+        (None, true) if app.squares.stuttering => format!(" {number}♪ STUTTER "),
+        (None, true) => format!(" {number}♪ ON AIR "),
+        _ if sq.loading => format!(" {number}{} ", spinner(app.frame)),
+        _ if number.is_empty() => String::new(),
+        _ => format!(" {}", number),
+    };
+    // Every square's sticker blinks on its own beat: in time, they blink together.
+    let flash = sq.meter.phase.is_some_and(|p| p < 0.15) && !app.squares.paused && next.is_none();
+    let state_style = if flash { Style::default().bg(rgb(s.letter)).fg(rgb(s.ink)).add_modifier(Modifier::BOLD) } else { sticker };
+
+    // The tempo it is running at, whether it is in time, and for the one
+    // playing, which beat of the bar it is on: the one is coming.
+    let sync = match sq.meter.sync {
+        _ if live => "",
+        Sync::Locked => " ⇄ in time",
+        Sync::Listening => " … listening",
+        Sync::Apart => " ≠ too far apart",
+    };
+    let count = match sq.meter.bar {
+        Some(bar) if live => {
+            let at = (bar * 4.0) as usize;
+            format!("  {}", (0..4).map(|k| if k == at { '●' } else { '○' }).collect::<String>())
+        }
+        _ => String::new(),
+    };
+    let tempo = sq.meter.bpm.map(|bpm| {
+        let full = format!(" {bpm:.0} BPM{sync}{count} ");
+        // Short of room, the sign alone says it.
+        if full.width() > tw as usize { format!(" {bpm:.0} BPM{}{count} ", sync.split(' ').take(2).collect::<Vec<_>>().join(" ")) } else { full }
+    });
+
+    // The title as a headline: capitals, broken over up to three strips.
+    let room = at.text_bottom.saturating_sub(at.text_top) as usize;
+    let mut title = wrap(&track.name.to_uppercase(), tw.saturating_sub(2).max(4) as usize);
+    let most = room.saturating_sub(3 + !state.is_empty() as usize).clamp(1, 3);
+    if title.len() > most {
+        title.truncate(most);
+        if let Some(last) = title.last_mut() {
+            last.push('…');
         }
     }
-
-    // The title in a caption box under the cover, the artist under that.
-    let placed = pop::place(rect.width as u32, rect.height as u32 * 2, &look);
-    let under = ((placed.cy + placed.half * 1.3 + 1.0) / 2.0).ceil() as u16;
-    // Leaving the bottom row for how far through the song it is.
-    let y = (rect.y + under).min(rect.bottom().saturating_sub(4)).max(rect.y + 2);
-    let title = format!(" {} ", track.name.to_uppercase());
-    let title_w = (title.width() as u16).min(rect.width.saturating_sub(4));
-    let tx = rect.x + (rect.width.saturating_sub(title_w)) / 2;
-    put(buf, tx, y, title_w, &title, if live { sticker } else { Style::default().bg(rgb(s.ink)).fg(rgb(s.paper)).add_modifier(Modifier::BOLD) });
-    if y + 1 < rect.bottom().saturating_sub(1) {
-        let artist = format!(" {} ", track.artist_line());
-        let aw = (artist.width() as u16).min(rect.width.saturating_sub(6));
-        put(buf, rect.x + (rect.width.saturating_sub(aw)) / 2, y + 1, aw, &artist, Style::default().bg(rgb(s.paper)).fg(rgb(s.ink)));
+    let progress = live && track.duration_ms > 0;
+    let lines = !state.is_empty() as usize * 2 + title.len() + 1 + tempo.is_some() as usize + progress as usize;
+    let mut y = rect.y + at.text_top + (room.saturating_sub(lines) / 2) as u16;
+    if !at.beside {
+        // Under the cover the state sits in the corner, out of the way.
+        put(buf, rect.x + 2, rect.y + 1, tw, &state, state_style);
+    } else if !state.is_empty() {
+        line(buf, y, &state, state_style);
+        y += 2;
+    }
+    let strip = if live { sticker } else { Style::default().bg(rgb(s.ink)).fg(rgb(s.paper)).add_modifier(Modifier::BOLD) };
+    for words in &title {
+        if y >= rect.bottom().saturating_sub(1) {
+            break;
+        }
+        line(buf, y, &format!(" {words} "), strip);
+        y += 1;
+    }
+    if y < rect.bottom().saturating_sub(1) {
+        line(buf, y, &format!(" {} ", track.artist_line()), plain.add_modifier(Modifier::BOLD));
+        y += 1;
+    }
+    if let (Some(tempo), true) = (tempo, y < rect.bottom().saturating_sub(1)) {
+        line(buf, y, &tempo, plain);
+        y += 1;
     }
 
-    // Along the bottom of the one heard: how far through the song.
-    if live && rect.height >= 8 && track.duration_ms > 0 {
-        let by = rect.bottom() - 2;
-        let bw = rect.width.saturating_sub(6);
+    // How far through the song: a rule as wide as the words.
+    if progress && y < rect.bottom().saturating_sub(1) {
+        let bw = tw.min(if at.beside { tw } else { rect.width.saturating_sub(6) });
+        let bx = if at.beside && towards_right { tx + tw - bw } else if at.beside { tx } else { rect.x + (rect.width - bw) / 2 };
         let filled = ((sq.pos_ms as f64 / track.duration_ms as f64).min(1.0) * bw as f64) as u16;
         for i in 0..bw {
             let (ch, color) = if i < filled { ('━', s.ink) } else { ('─', art::mix(s.paper, s.ink, 0.35)) };
-            if let Some(cell) = buf.cell_mut((rect.x + 3 + i, by)) {
+            if let Some(cell) = buf.cell_mut((bx + i, y)) {
                 cell.set_char(ch).set_fg(rgb(color)).set_bg(rgb(s.paper));
             }
         }
     }
     let _ = th;
+}
+
+/// Where the four squares meet: a disc that pulses on the beat, with an
+/// arrow to the square the music is heading for.
+fn draw_hub(buf: &mut Buffer, app: &App, area: Rect) {
+    let (cx, cy) = (area.x as f32 + (area.width / 2) as f32, (area.y + area.height / 2) as f32 * 2.0);
+    let radius = (area.height as f32 * 0.17).clamp(3.5, 6.0) * (1.0 + 0.08 * app.beat);
+    let ink = (14, 10, 24);
+    let ring = art::mix((255, 255, 255), (255, 226, 70), app.beat);
+    // Each cell is two pixels: its top in the foreground colour of `▀`, its
+    // bottom in the background. Squares are all drawn that way, so a pixel
+    // can be read back off them and changed alone.
+    let pixel = |x: f32, y: f32| -> Option<art::Rgb> {
+        let r = ((x - cx) * (x - cx) + (y - cy) * (y - cy)).sqrt();
+        if r <= radius - 1.5 {
+            Some(ink)
+        } else if r <= radius {
+            Some(ring)
+        } else if r <= radius + 1.0 {
+            Some(ink)
+        } else {
+            None
+        }
+    };
+    let reach = radius as i32 + 2;
+    for row in (cy / 2.0) as i32 - reach / 2 - 1..=(cy / 2.0) as i32 + reach / 2 + 1 {
+        for col in cx as i32 - reach..=cx as i32 + reach {
+            let (Ok(x), Ok(y)) = (u16::try_from(col), u16::try_from(row)) else { continue };
+            let (top, bottom) = (pixel(col as f32 + 0.5, row as f32 * 2.0 + 0.5), pixel(col as f32 + 0.5, row as f32 * 2.0 + 1.5));
+            if top.is_none() && bottom.is_none() {
+                continue;
+            }
+            let Some(cell) = buf.cell_mut((x, y)) else { continue };
+            let read = |c: Color| match c {
+                Color::Rgb(r, g, b) => (r, g, b),
+                _ => ink,
+            };
+            let (was_top, was_bottom) = (read(cell.fg), read(cell.bg));
+            cell.set_char('▀').set_fg(rgb(top.unwrap_or(was_top))).set_bg(rgb(bottom.unwrap_or(was_bottom)));
+        }
+    }
+    // In the middle: where the music is going, or a note on the beat.
+    let arrow = match app.squares.next.map(|n| n.to) {
+        Some(0) => "↖",
+        Some(1) => "↗",
+        Some(2) => "↙",
+        Some(3) => "↘",
+        _ if app.beat > 0.4 => "♪",
+        _ => "·",
+    };
+    let style = Style::default().bg(rgb(ink)).fg(rgb(ring)).add_modifier(Modifier::BOLD);
+    put(buf, cx as u16, (cy / 2.0) as u16, 1, arrow, style);
 }
 
 /// With the squares on and the songs on screen, the bottom bar shows all four.
