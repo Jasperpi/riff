@@ -52,11 +52,24 @@ struct Shared {
 pub struct Output {
     shared: Arc<Shared>,
     _stream: cpal::Stream,
+    /// Samples allowed to wait before a writer is held back: see `WAITING`.
+    waiting: usize,
 }
 
 impl Output {
     /// Open the default output device. Fails if there is none.
     pub fn open() -> Result<Self> {
+        Self::open_with(WAITING)
+    }
+
+    /// Open it with more audio kept waiting in front of the sound card, for
+    /// a writer that can stall now and then and whose changes needn't be
+    /// heard at once. `ms` of audio, at least the usual 17.
+    pub fn open_with_room(ms: u32) -> Result<Self> {
+        Self::open_with((ms as usize * RATE as usize / 1000 * 2).max(WAITING))
+    }
+
+    fn open_with(waiting: usize) -> Result<Self> {
         let device = cpal::default_host().default_output_device().ok_or_else(|| anyhow!("no audio output device"))?;
         let supported: Vec<_> = device.supported_output_configs()?.collect();
         // Stereo at the music's own rate if the device will take it, in the
@@ -99,7 +112,7 @@ impl Output {
             config.channels,
             chosen.sample_format()
         );
-        Ok(Self { shared, _stream: stream })
+        Ok(Self { shared, _stream: stream, waiting })
     }
 
     /// Sound or silence. Stopping is immediate; what is waiting stays put and
@@ -116,7 +129,7 @@ impl Output {
         let length = Duration::from_secs_f64(samples.len() as f64 / 2.0 / RATE as f64);
         let mut queue = self.shared.queue.lock().unwrap();
         let since = Instant::now();
-        while queue.buf.len() > WAITING {
+        while queue.buf.len() > self.waiting {
             if since.elapsed() > Duration::from_millis(300) && !self.alive() {
                 drop(queue);
                 std::thread::sleep(length);

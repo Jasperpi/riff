@@ -1338,7 +1338,7 @@ impl App {
                 self.squares.squares[d].track = Some(track);
                 self.squares.squares[d].pos_ms = at;
             }
-            self.quad_demo = Some(DemoQuad { since: self.frame, ..Default::default() });
+            self.quad_demo = Some(DemoQuad { since: DemoQuad::now(self.frame), ..Default::default() });
         } else {
             let Some(be) = self.backend.clone() else { return false };
             let Some((session, volume)) = be.engine.deck_parts() else {
@@ -1515,17 +1515,24 @@ impl App {
         let beat = (frame % DEMO_BEAT) as f32 / DEMO_BEAT as f32;
         let bar = (frame % (DEMO_BEAT * 4)) as f32 / (DEMO_BEAT * 4) as f32;
         let mut heard = [0.0; crate::quad::SQUARES];
+        let now = DemoQuad::now(frame);
+        let period = DemoQuad::grid().period;
         let next = match demo.next {
-            Some((to, mv, at, length)) if frame >= at => {
-                let p = ((frame - at) as f32 / length.max(1) as f32).clamp(0.0, 1.0);
-                let ((out, _), (inn, _)) = crate::quad::blend_at(mv, p);
-                heard[demo.live] = out;
-                heard[to] = inn;
-                Some(Next { to, mv, beats_left: 0.0, progress: Some(p) })
-            }
-            Some((to, mv, at, _)) => {
-                heard[demo.live] = 1.0;
-                Some(Next { to, mv, beats_left: (at - frame) as f32 / DEMO_BEAT as f32, progress: None })
+            Some((to, mv, asked, at)) => {
+                use crate::quad::Stage;
+                let landing = now >= at;
+                let stage = if landing {
+                    Stage::Landing((((now - at) / DemoQuad::landing(mv)) as f32).clamp(0.0, 1.0))
+                } else {
+                    Stage::Coming((((now - asked) / (at - asked).max(1.0)) as f32).clamp(0.0, 1.0))
+                };
+                let (out, inn, _) = crate::quad::shape(mv, stage);
+                heard[demo.live] = out.gain;
+                heard[to] = inn.gain;
+                Some(match stage {
+                    Stage::Landing(p) => Next { to, mv, beats_left: 0.0, progress: Some(p) },
+                    Stage::Coming(_) => Next { to, mv, beats_left: ((at - now) / period) as f32, progress: None },
+                })
             }
             None => {
                 heard[demo.live] = 1.0;
@@ -2940,41 +2947,54 @@ fn start_point(track: &Track) -> u32 {
 const DEMO_BEAT: u64 = 15;
 
 /// The squares of demo mode: the same rules as the real ones, kept by a
-/// steady pretend beat.
+/// steady pretend beat. Time is counted in the mixer's analysis steps.
 #[derive(Default)]
 struct DemoQuad {
     live: usize,
-    /// The frame the square being heard took over.
-    since: u64,
-    /// A switch on its way: to, how, from which frame, for how many frames.
-    next: Option<(usize, crate::quad::Move, u64, u64)>,
+    /// When the square being heard took over.
+    since: f64,
+    /// A switch on its way: to, how, when asked for, when it lands.
+    next: Option<(usize, crate::quad::Move, f64, f64)>,
     paused: bool,
     stutter_until: u64,
 }
 
 impl DemoQuad {
+    /// Steps of the mixer's clock at a demo frame (thirty a second).
+    fn now(frame: u64) -> f64 {
+        frame as f64 * crate::dj::HOPS_PER_SEC as f64 / 30.0
+    }
+
+    /// The demo's beat on that clock: one every `DEMO_BEAT` frames, bars from frame 0.
+    fn grid() -> crate::quad::Grid {
+        let period = Self::now(DEMO_BEAT);
+        crate::quad::Grid { period, beat_at: 0.0, bar_at: Some(0.0) }
+    }
+
+    /// How long the landing of a move lasts, in steps.
+    fn landing(mv: crate::quad::Move) -> f64 {
+        if mv == crate::quad::Move::Blend { Self::grid().period } else { 2.0 }
+    }
+
     fn go(&mut self, to: usize, slam: bool, frame: u64) {
-        use crate::quad::Move;
+        let now = Self::now(frame);
         match self.next {
-            Some((_, _, at, _)) if frame >= at => return,
+            Some((_, _, _, at)) if now >= at => return,
             Some(_) if to == self.live => return self.next = None,
             None if to == self.live => return,
             _ => {}
         }
-        let stayed = if self.next.is_some() { 0.0 } else { (frame - self.since) as f64 / DEMO_BEAT as f64 };
+        let stayed = if self.next.is_some() { 0.0 } else { (now - self.since) / Self::grid().period };
         let mv = crate::quad::choose(stayed, true, slam);
-        let spacing = if mv == Move::Cut { DEMO_BEAT } else { DEMO_BEAT * 4 };
-        let earliest = frame + 4 + if matches!(mv, Move::Roll | Move::Sweep) { DEMO_BEAT / 2 } else { 0 };
-        let at = earliest.div_ceil(spacing) * spacing;
-        let length = if mv == Move::Blend { DEMO_BEAT * 4 } else { 1 };
-        self.next = Some((to, mv, at, length));
+        self.next = Some((to, mv, now, crate::quad::when(now, now, Some(Self::grid()), mv)));
     }
 
     fn step(&mut self, frame: u64) {
-        if let Some((to, _, at, length)) = self.next {
-            if frame >= at + length {
+        let now = Self::now(frame);
+        if let Some((to, mv, _, at)) = self.next {
+            if now >= at + Self::landing(mv) {
                 self.live = to;
-                self.since = frame;
+                self.since = now;
                 self.next = None;
             }
         }
@@ -3264,9 +3284,11 @@ mod tests {
         }
         assert_eq!(app.squares.live, 2, "the switch never landed");
         assert!(app.squares.next.is_none());
-        // The switch landed on a bar of the demo's beat.
-        let at = app.quad_demo.as_ref().unwrap().since;
-        assert!(app.frame >= at);
+        // It took over a beat after landing on a half-bar of the demo's beat.
+        let since = app.quad_demo.as_ref().unwrap().since;
+        let half_bar = DemoQuad::grid().period * 2.0;
+        let landed = since - DemoQuad::landing(crate::quad::Move::Blend);
+        assert!((landed / half_bar - (landed / half_bar).round()).abs() < 0.05, "landed off the half-bar: {landed}");
         // Back out to the songs: they keep playing, and enter fills a square.
         key(&mut app, KeyCode::Esc);
         assert_eq!(app.screen, Screen::Browse);

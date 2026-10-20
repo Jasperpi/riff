@@ -6,11 +6,12 @@
 //! whichever square is picked next is already in time, and the switch can
 //! land on the one.
 //!
-//! Picking a square never switches on the spot. The switch waits for the
-//! next bar (or, for quick flicking, the next beat) and goes over in a way
-//! that suits how it was asked for: a long blend with the bass lines
-//! swapping half-way, a stutter into a drop, a straight cut, or, for a song
-//! whose tempo can't be matched, a sweep that clears the floor for it.
+//! Picking a square is heard at once but lands on the beat: the new song's
+//! top end creeps in, or the old song lifts, and on the next beat (the next
+//! half-bar for a blend) the new one takes over. How it goes over suits how
+//! it was asked for: a blend with the bass lines swapping on the beat, a
+//! straight cut for quick flicking, a stutter into a drop on shift, or, for
+//! a song whose tempo can't be matched, a sweep that clears the floor for it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -31,20 +32,25 @@ use crate::model::Track;
 use crate::out::Output;
 
 pub const SQUARES: usize = 4;
+/// Audio kept ready in front of the sound card, in milliseconds.
+const OUTPUT_MS: u32 = 90;
 
-/// How one square takes over from another.
+/// How one square takes over from another. Every move starts to be heard
+/// the moment it is asked for and lands on the beat.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Move {
-    /// Over a bar: the new song comes up with its bass held back, the two
-    /// bass lines swap on the third beat, and the old song bows out.
+    /// The new song's top end creeps in straight away under the old one;
+    /// on the next half-bar its bass takes over and the old song bows out
+    /// over a beat.
     Blend,
     /// The old song's last beat stutters, faster and faster, and the new one
-    /// drops on the one.
+    /// drops on the beat after.
     Roll,
-    /// Straight over, on the beat.
+    /// The old song lifts (its lows thin out) and the new one cuts in on
+    /// the next beat.
     Cut,
-    /// The old song is swept up and away over a beat, and the new one drops
-    /// in its place. For a song that couldn't be put in time with the other.
+    /// The old song is swept up and away and the new one drops in on the
+    /// next beat. For a song that couldn't be put in time with the other.
     Sweep,
 }
 
@@ -57,19 +63,10 @@ impl Move {
             Self::Sweep => "sweep",
         }
     }
-
-    /// How long before the switch the old song starts doing something about it.
-    fn lead_in(self) -> f64 {
-        match self {
-            Self::Roll | Self::Sweep => 1.0,
-            Self::Blend | Self::Cut => 0.0,
-        }
-    }
 }
 
-/// The move that suits a switch: the longer the song being left has had,
-/// the more of a transition it gets. Flicking between squares chops on the
-/// beat; settling on one blends. `slam` asks for a drop whatever.
+/// The move that suits a switch. Flicking between squares chops on the
+/// beat; settling on one blends; `slam` (shift) asks for the stutter.
 pub fn choose(stayed_beats: f64, matched: bool, slam: bool) -> Move {
     if !matched {
         Move::Sweep
@@ -77,8 +74,6 @@ pub fn choose(stayed_beats: f64, matched: bool, slam: bool) -> Move {
         Move::Roll
     } else if stayed_beats < 4.0 {
         Move::Cut
-    } else if stayed_beats < 16.0 {
-        Move::Roll
     } else {
         Move::Blend
     }
@@ -103,37 +98,67 @@ fn next_on(from: f64, origin: f64, spacing: f64) -> f64 {
     origin + ((from - origin) / spacing).ceil() * spacing
 }
 
-/// When a switch asked for at step `now` should land. A cut goes on the
-/// next beat; anything else on the next bar, leaving the old song a beat
-/// to roll or sweep in if the move needs one. Without a beat to go by, in
-/// a tenth of a second.
-pub fn when(now: f64, grid: Option<Grid>, mv: Move) -> f64 {
-    let soon = now + HOPS_PER_SEC as f64 * 0.1;
+/// When a switch asked for at step `now` should land, no sooner than
+/// `ready` (the new song may still be held back to line up its bar). A
+/// blend lands on the next half-bar, the one or the three; a stutter on the
+/// beat after a whole beat of it; anything else on the next beat. Without a
+/// beat to go by, in a tenth of a second.
+pub fn when(now: f64, ready: f64, grid: Option<Grid>, mv: Move) -> f64 {
+    let soon = (now + HOPS_PER_SEC as f64 * 0.1).max(ready);
     let Some(g) = grid.filter(|g| g.period > 1.0) else { return soon };
-    // A switch needs a moment's notice so it never lands mid-block.
-    let earliest = now + HOPS_PER_SEC as f64 * 0.12 + mv.lead_in() * g.period * 0.5;
+    // A moment's notice, so a switch never lands mid-block and a blend has
+    // a little time for the new song to be heard coming.
+    let notice = HOPS_PER_SEC as f64 * if mv == Move::Blend { 0.25 } else { 0.12 };
+    let earliest = (now + notice).max(ready);
     match mv {
-        Move::Cut => next_on(earliest, g.beat_at, g.period),
-        _ => next_on(earliest, g.bar_at.unwrap_or(g.beat_at), g.period * 4.0),
+        Move::Blend => next_on(earliest, g.bar_at.unwrap_or(g.beat_at), g.period * 2.0),
+        Move::Roll => next_on(earliest + g.period, g.beat_at, g.period),
+        Move::Cut | Move::Sweep => next_on(earliest, g.beat_at, g.period),
     }
 }
 
-/// How loud the outgoing and incoming songs are `p` of the way through a
-/// move, and whether each has its lows: the blend holds the new song's
-/// bass back until half-way, then hands it over.
-pub fn blend_at(mv: Move, p: f32) -> ((f32, bool), (f32, bool)) {
+/// How far into a switch: from the press to the landing, then from the
+/// landing to done.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Stage {
+    Coming(f32),
+    Landing(f32),
+}
+
+/// One song in a switch: how loud, and its EQ (low, mid, high, in steps from flat).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Side {
+    pub gain: f32,
+    pub eq: [i8; 3],
+}
+
+const FULL: Side = Side { gain: 1.0, eq: [0, 0, 0] };
+const SILENT: Side = Side { gain: 0.0, eq: [0, 0, 0] };
+
+/// What the old and the new song sound like at a stage of a switch, and how
+/// far the old one is swept up (0 not at all, 1 all the way).
+pub fn shape(mv: Move, stage: Stage) -> (Side, Side, f32) {
     use std::f32::consts::FRAC_PI_2;
-    match mv {
-        Move::Blend => {
-            let up = (p * 2.0).clamp(0.0, 1.0);
-            let down = (p * 2.0 - 1.0).clamp(0.0, 1.0);
-            let half = p >= 0.5;
-            // Exactly silent at the end, so a finished song costs nothing to mix.
-            let out = if down >= 1.0 { 0.0 } else { (down * FRAC_PI_2).cos() };
-            ((out, !half), ((up * FRAC_PI_2).sin(), half))
+    let smooth = |t: f32| {
+        let t = t.clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    match (mv, stage) {
+        // The new song's highs, and some of its mids, come up under the old one.
+        (Move::Blend, Stage::Coming(c)) => (FULL, Side { gain: 0.5 * smooth(c), eq: [EQ_KILL, -2, 0] }, 0.0),
+        // On the beat the bass lines swap; the old song is gone a beat later.
+        (Move::Blend, Stage::Landing(p)) => {
+            let out = if p >= 1.0 { 0.0 } else { (p.clamp(0.0, 1.0) * FRAC_PI_2).cos() };
+            (Side { gain: out, eq: [EQ_KILL, 0, 0] }, Side { gain: 0.5 + 0.5 * smooth(p * 2.0), eq: [0, 0, 0] }, 0.0)
         }
-        _ if p <= 0.0 => ((1.0, true), (0.0, true)),
-        _ => ((0.0, true), (1.0, true)),
+        (Move::Cut, Stage::Coming(c)) => (FULL, SILENT, 0.6 * c),
+        (Move::Sweep, Stage::Coming(c)) => (FULL, SILENT, c),
+        (Move::Roll, Stage::Coming(_)) => (FULL, SILENT, 0.0),
+        // The old song stays lifted while it fades: letting its bass back in
+        // at that moment would be heard as a click.
+        (Move::Cut, Stage::Landing(_)) => (SILENT, FULL, 0.6),
+        (Move::Sweep, Stage::Landing(_)) => (SILENT, FULL, 1.0),
+        (_, Stage::Landing(_)) => (SILENT, FULL, 0.0),
     }
 }
 
@@ -193,21 +218,66 @@ impl Sweep {
         Self { filters: [[Biquad::new(30.0, true); 2]; 2] }
     }
 
-    /// `t` runs 0..1 over the sweep.
+    /// `t` runs 0..1 over the sweep: from 30 Hz up to 360, taking the bass
+    /// and the kick away but leaving the voice and the tune.
     fn run(&mut self, block: &mut [f64], t: f32) {
-        let to = 30.0 * 100f64.powf(t.clamp(0.0, 1.0) as f64);
+        let to = 30.0 * 12f64.powf(t.clamp(0.0, 1.0) as f64);
         for channel in &mut self.filters {
             for f in channel.iter_mut() {
                 f.retune(to, true);
             }
         }
-        let fade = 1.0 - 0.35 * t as f64;
+        let fade = 1.0 - 0.15 * t as f64;
         for pair in block.chunks_exact_mut(2) {
             for (c, sample) in pair.iter_mut().enumerate() {
                 let v = self.filters[c][0].run(*sample);
                 *sample = self.filters[c][1].run(v) * fade;
             }
         }
+    }
+}
+
+/// The old song's last moments, repeating and dying away under the new
+/// one: what a DJ does when two songs won't go together any other way.
+/// Repeats every half beat of the old song, thinned of its lows so the tail
+/// never muddies the new song's bass.
+struct Echo {
+    line: Vec<f64>,
+    at: usize,
+    low: [f64; 2],
+    /// Frames since anything was last sent in.
+    quiet: usize,
+}
+
+impl Echo {
+    const FEEDBACK: f64 = 0.5;
+    const WET: f64 = 0.55;
+
+    fn new(delay_frames: usize) -> Self {
+        Self { line: vec![0.0; delay_frames.max(OUT) * 2], at: 0, low: [0.0; 2], quiet: 0 }
+    }
+
+    /// Add the echo of what has been sent so far to `mix`, sending in `send`
+    /// (the old song, or nothing once it has gone).
+    fn run(&mut self, send: Option<&[f64]>, mix: &mut [f64]) {
+        self.quiet = if send.is_some() { 0 } else { self.quiet + mix.len() / 2 };
+        for i in 0..mix.len() / 2 {
+            for c in 0..2 {
+                let slot = 2 * self.at + c;
+                let out = self.line[slot];
+                let into = send.map_or(0.0, |s| s[2 * i + c]);
+                // Thin each repeat's lows a little more.
+                self.low[c] += 0.03 * (out - self.low[c]);
+                self.line[slot] = into + (out - self.low[c]) * Self::FEEDBACK;
+                mix[2 * i + c] += out * Self::WET;
+            }
+            self.at = (self.at + 1) % (self.line.len() / 2);
+        }
+    }
+
+    /// Died away: a few seconds with nothing new.
+    fn done(&self) -> bool {
+        self.quiet > (RATE * 3.0) as usize
     }
 }
 
@@ -241,8 +311,8 @@ impl Follow {
 
 enum Phase {
     Steady,
-    /// A switch is coming, at step `at`.
-    Waiting { to: usize, mv: Move, at: f64 },
+    /// A switch asked for at step `asked`, to land at step `at`.
+    Waiting { to: usize, mv: Move, asked: f64, at: f64 },
     /// Going over, from step `start` for `length` steps.
     Moving { from: usize, to: usize, mv: Move, start: f64, length: f64 },
 }
@@ -476,9 +546,11 @@ struct Mixer {
     stutter: Option<(usize, f64, Stutter)>,
     stutter_asked: bool,
     sweep: Option<Sweep>,
+    echo: Option<Echo>,
     gains: [f32; SQUARES],
-    /// Whether each deck's lows are let through.
-    lows: [bool; SQUARES],
+    /// Each deck's EQ as it is now. It moves a step a block towards where a
+    /// switch wants it, so a bass swap takes 35 ms rather than thumping.
+    eq: [[i8; 3]; SQUARES],
     notes: Vec<String>,
 }
 
@@ -495,8 +567,9 @@ impl Mixer {
             stutter: None,
             stutter_asked: false,
             sweep: None,
+            echo: None,
             gains: [1.0, 0.0, 0.0, 0.0],
-            lows: [true; SQUARES],
+            eq: [[0; 3]; SQUARES],
             notes: Vec::new(),
         }
     }
@@ -541,17 +614,20 @@ impl Mixer {
         };
         let matched = matches!(self.follow[to], Follow::Locked(_));
         let mv = choose(stayed, matched, slam);
-        self.phase = Phase::Waiting { to, mv, at: when(now, grid, mv) };
+        // A square still being held back to line up its bar would land in silence.
+        let ready = now + (self.decks[to].hold / HOP) as f64;
+        self.phase = Phase::Waiting { to, mv, asked: now, at: when(now, ready, grid, mv) };
     }
 
     /// Start a move that has come due, or finish one that is done.
     fn advance(&mut self, shared: &Shared) {
         let now = self.now();
         match self.phase {
-            Phase::Waiting { to, mv, at } if now >= at => {
+            Phase::Waiting { to, mv, at, .. } if now >= at => {
                 let length = match (mv, self.grid()) {
-                    (Move::Blend, Some(g)) => g.period * 4.0,
-                    (Move::Blend, None) => HOPS_PER_SEC as f64 * 4.0,
+                    // The old song bows out over a beat.
+                    (Move::Blend, Some(g)) => g.period,
+                    (Move::Blend, None) => HOPS_PER_SEC as f64 * 0.5,
                     // One block, so the gains glide over rather than click.
                     _ => (OUT / HOP) as f64,
                 };
@@ -571,7 +647,8 @@ impl Mixer {
         let was_locked = matches!(self.follow[to], Follow::Locked(_));
         self.live = to;
         self.since = self.now();
-        // A stutter belongs to the song it was cutting up.
+        // A stutter belongs to the song it was cutting up; once that song is
+        // silent, it has done its job.
         if self.stutter.as_ref().is_some_and(|(deck, ..)| *deck != to) {
             self.stutter = None;
         }
@@ -643,27 +720,202 @@ impl Mixer {
         }
     }
 
-    /// How loud each square should be right now, and whether it has its lows.
-    fn levels(&self) -> ([f32; SQUARES], [bool; SQUARES]) {
+    /// How loud each square should be right now, where its EQ should be,
+    /// and how far the one being left is swept up.
+    fn levels(&self) -> ([f32; SQUARES], [[i8; 3]; SQUARES], f32) {
         let mut gains = [0.0; SQUARES];
-        let mut lows = [true; SQUARES];
-        match self.phase {
+        let mut eq = [[0; 3]; SQUARES];
+        let (from, to, (out, inn, sweep)) = match self.phase {
+            Phase::Steady => {
+                gains[self.live] = 1.0;
+                return (gains, eq, 0.0);
+            }
+            Phase::Waiting { to, mv, asked, at } => {
+                let c = ((self.now() - asked) / (at - asked).max(1.0)) as f32;
+                (self.live, to, shape(mv, Stage::Coming(c.clamp(0.0, 1.0))))
+            }
             Phase::Moving { from, to, mv, start, length } => {
                 let p = ((self.now() - start) / length.max(1.0)) as f32;
-                let ((out, out_low), (inn, in_low)) = blend_at(mv, p.clamp(0.0, 1.0));
-                gains[from] = out;
-                lows[from] = out_low;
-                gains[to] = inn;
-                lows[to] = in_low;
+                (from, to, shape(mv, Stage::Landing(p.clamp(0.0, 1.0))))
             }
-            _ => gains[self.live] = 1.0,
+        };
+        (gains[from], eq[from]) = (out.gain, out.eq);
+        (gains[to], eq[to]) = (inn.gain, inn.eq);
+        (gains, eq, sweep)
+    }
+
+    /// Mix one block of `OUT` frames into `mix`: take requests, move any
+    /// switch along, pull each square, keep the silent ones in time, apply
+    /// the effects and sum. Returns each square's level, and whether any
+    /// square is playing at all.
+    fn run_block(&mut self, shared: &Shared, scratch: &mut [Vec<f64>; SQUARES], mix: &mut [f64]) -> ([f32; SQUARES], bool) {
+        let playing: [bool; SQUARES] = std::array::from_fn(|d| shared.decks[d].playing.load(Ordering::Relaxed));
+
+        // ---- the square being heard went quiet: carry on with another
+        if !playing[self.live] && matches!(self.phase, Phase::Steady) {
+            if let Some(d) = (1..SQUARES).map(|k| (self.live + k) % SQUARES).find(|d| playing[*d]) {
+                let from = self.live;
+                self.take_over(shared, from, d);
+                self.follow[from] = Follow::Listening;
+            }
         }
-        (gains, lows)
+
+        // ---- requests from the interface
+        let requests: Vec<Request> = shared.requests.lock().unwrap().drain(..).collect();
+        for request in requests {
+            match request {
+                Request::Go { to, slam } => self.go(shared, to, slam),
+                Request::Stutter => self.stutter_asked = true,
+            }
+        }
+
+        // ---- near the end of the song being heard, move on by itself
+        if matches!(self.phase, Phase::Steady) && playing[self.live] {
+            let feed = shared.decks[self.live].feed.lock().unwrap();
+            let left = feed.dur.saturating_sub(feed.pos) as f64 / RATE;
+            drop(feed);
+            if left < 14.0 && feed_known(shared, self.live) {
+                if let Some(d) = (1..SQUARES).map(|k| next_round(self.live, k)).find(|d| playing[*d]) {
+                    self.notes.push(format!("Square {} is ending: over to square {}", square_name(self.live), square_name(d)));
+                    self.since = f64::MIN / 4.0;
+                    self.go(shared, d, false);
+                }
+            }
+        }
+
+        self.advance(shared);
+        if let Some((to, slam)) = self.queued.take() {
+            if matches!(self.phase, Phase::Steady) {
+                self.go(shared, to, slam);
+            } else {
+                self.queued = Some((to, slam));
+            }
+        }
+
+        // ---- the leader's beat, for stutters and sweeps
+        let now = self.now();
+        let grid = self.grid();
+        let beat_frames = grid.map_or(RATE as usize / 2, |g| (g.period * HOP as f64) as usize).max(OUT * 4);
+        if std::mem::take(&mut self.stutter_asked) && self.stutter.is_none() {
+            let at = grid.map_or(now, |g| next_on(now + 1.0, g.beat_at, g.period));
+            self.stutter = Some((self.live, at, Stutter::new(beat_frames)));
+        }
+        if let Phase::Waiting { mv: Move::Roll, at, .. } = self.phase {
+            // A beat before the switch, which is on a beat itself (or from
+            // now, with no beat to go by): it ends exactly as the new song drops.
+            let begin = (at - beat_frames as f64 / HOP as f64).max(now);
+            if now >= begin && self.stutter.is_none() {
+                // And carries on a moment past it, while the old song fades:
+                // going back to the song itself just then would click.
+                let length = ((at - begin) * HOP as f64) as usize + OUT * 2;
+                self.stutter = Some((self.live, begin, Stutter::new(length)));
+            }
+        }
+        // ---- pull each square
+        let mut any = false;
+        let (targets, eq, sweeping) = self.levels();
+        if sweeping > 0.0 && self.sweep.is_none() {
+            self.sweep = Some(Sweep::new());
+        }
+        for d in 0..SQUARES {
+            let deck = &shared.decks[d];
+            let block = &mut scratch[d];
+            if !playing[d] {
+                block.fill(0.0);
+                self.decks[d].level *= 0.9;
+                self.decks[d].was_playing = false;
+                self.decks[d].tempo.idle(OUT);
+                continue;
+            }
+            if !std::mem::replace(&mut self.decks[d].was_playing, true) {
+                self.decks[d].tempo.reset();
+                self.decks[d].eq.reset();
+            }
+            any = true;
+            let rate = load_f32(&deck.rate) as f64;
+            let mut feed = deck.feed.lock().unwrap();
+            let real = pull(&mut feed, &mut self.decks[d], rate, block);
+            let ran_out = real == 0 && feed.ended && feed.buf.len() < 4;
+            drop(feed);
+            if ran_out {
+                deck.playing.store(false, Ordering::Relaxed);
+                shared.info.lock().unwrap().finished.push(d);
+            }
+            self.decks[d].tempo.on_request = true;
+            self.decks[d].tempo.feed(block);
+            for band in 0..3 {
+                let (now, want) = (self.eq[d][band], eq[d][band]);
+                self.eq[d][band] = now + (want - now).signum();
+            }
+            let steps = self.eq[d];
+            self.decks[d].eq.run(block, steps);
+            let peak = block.iter().fold(0.0f64, |p, v| p.max(v.abs())) as f32;
+            self.decks[d].level = self.decks[d].level * 0.9 + peak * 0.1;
+        }
+        // One tempo estimate a block at most, the most overdue first: four
+        // at once would take several blocks' worth of time in one.
+        if let Some(t) = self.decks.iter_mut().map(|d| &mut d.tempo).filter(|t| t.due()).max_by_key(|t| t.waited()) {
+            t.refresh();
+        }
+        self.follow(shared);
+
+        // ---- effects on the square being heard
+        let live = self.live;
+        if let Some((deck, at, stutter)) = self.stutter.as_mut() {
+            if now >= *at {
+                stutter.run(&mut scratch[*deck]);
+            }
+        }
+        if self.stutter.as_ref().is_some_and(|(_, _, s)| s.done()) {
+            self.stutter = None;
+        }
+        if let (true, Some(sweep)) = (sweeping > 0.0, self.sweep.as_mut()) {
+            sweep.run(&mut scratch[live], sweeping);
+        }
+
+        // ---- sum, gliding each square's level across the block
+        mix.fill(0.0);
+        for d in 0..SQUARES {
+            let (from, to) = (self.gains[d], targets[d]);
+            if from == 0.0 && to == 0.0 {
+                continue;
+            }
+            for i in 0..OUT {
+                let g = (from + (to - from) * (i as f32 / OUT as f32)) as f64;
+                mix[2 * i] += scratch[d][2 * i] * g;
+                mix[2 * i + 1] += scratch[d][2 * i + 1] * g;
+            }
+        }
+        self.gains = targets;
+
+        // ---- an echo of the old song, for moves that cut rather than blend:
+        // its last half-beat (a whole beat for a sweep) is sent in, and the
+        // repeats die away under the new one.
+        let echoing = match self.phase {
+            Phase::Waiting { mv: mv @ (Move::Cut | Move::Sweep | Move::Roll), at, .. } => {
+                let send = if mv == Move::Sweep { 1.0 } else { 0.5 };
+                (now >= at - send * beat_frames as f64 / HOP as f64).then_some(self.live)
+            }
+            _ => None,
+        };
+        if echoing.is_some() && self.echo.is_none() {
+            self.echo = Some(Echo::new(beat_frames / 2));
+        }
+        if let Some(echo) = self.echo.as_mut() {
+            echo.run(echoing.map(|d| scratch[d].as_slice()), mix);
+            if echo.done() {
+                self.echo = None;
+            }
+        }
+        (targets, any)
     }
 }
 
 fn mixer_loop(shared: Arc<Shared>, volume: Box<dyn VolumeGetter + Send>) {
-    let out = Output::open().map_err(|e| log::warn!("quad output: {e}")).ok();
+    // Switches are timed to the music rather than to the key, so the squares
+    // can afford a deeper queue than the decks: one slow block (a tempo
+    // estimate, a busy machine) is then absorbed instead of heard as a gap.
+    let out = Output::open_with_room(OUTPUT_MS).map_err(|e| log::warn!("quad output: {e}")).ok();
     let mut monitor = Monitor::new();
     let mut m = Mixer::new();
     let mut started = false;
@@ -672,126 +924,7 @@ fn mixer_loop(shared: Arc<Shared>, volume: Box<dyn VolumeGetter + Send>) {
     let mut mix = vec![0.0f64; OUT * 2];
 
     while !shared.quit.load(Ordering::Relaxed) {
-        let playing: [bool; SQUARES] = std::array::from_fn(|d| shared.decks[d].playing.load(Ordering::Relaxed));
-
-        // ---- the square being heard went quiet: carry on with another
-        if !playing[m.live] && matches!(m.phase, Phase::Steady) {
-            if let Some(d) = (1..SQUARES).map(|k| (m.live + k) % SQUARES).find(|d| playing[*d]) {
-                let from = m.live;
-                m.take_over(&shared, from, d);
-                m.follow[from] = Follow::Listening;
-            }
-        }
-
-        // ---- requests from the interface
-        let requests: Vec<Request> = shared.requests.lock().unwrap().drain(..).collect();
-        for request in requests {
-            match request {
-                Request::Go { to, slam } => m.go(&shared, to, slam),
-                Request::Stutter => m.stutter_asked = true,
-            }
-        }
-
-        // ---- near the end of the song being heard, move on by itself
-        if matches!(m.phase, Phase::Steady) && playing[m.live] {
-            let feed = shared.decks[m.live].feed.lock().unwrap();
-            let left = feed.dur.saturating_sub(feed.pos) as f64 / RATE;
-            drop(feed);
-            if left < 14.0 && feed_known(&shared, m.live) {
-                if let Some(d) = (1..SQUARES).map(|k| next_round(m.live, k)).find(|d| playing[*d]) {
-                    m.notes.push(format!("Square {} is ending: over to square {}", square_name(m.live), square_name(d)));
-                    m.since = f64::MIN / 4.0;
-                    m.go(&shared, d, false);
-                }
-            }
-        }
-
-        m.advance(&shared);
-        if let Some((to, slam)) = m.queued.take() {
-            if matches!(m.phase, Phase::Steady) {
-                m.go(&shared, to, slam);
-            } else {
-                m.queued = Some((to, slam));
-            }
-        }
-
-        // ---- the leader's beat, for stutters and sweeps
-        let now = m.now();
-        let grid = m.grid();
-        let beat_frames = grid.map_or(RATE as usize / 2, |g| (g.period * HOP as f64) as usize).max(OUT * 4);
-        if std::mem::take(&mut m.stutter_asked) && m.stutter.is_none() {
-            let at = grid.map_or(now, |g| next_on(now + 1.0, g.beat_at, g.period));
-            m.stutter = Some((m.live, at, Stutter::new(beat_frames)));
-        }
-        if let Phase::Waiting { mv: Move::Roll, at, .. } = m.phase {
-            // From a beat before the switch, or from now if that is later:
-            // the roll always ends exactly as the new song drops.
-            let begin = (at - beat_frames as f64 / HOP as f64).max(now);
-            if now >= begin && m.stutter.is_none() {
-                m.stutter = Some((m.live, begin, Stutter::new(((at - begin) * HOP as f64) as usize)));
-            }
-        }
-        let sweeping = match m.phase {
-            Phase::Waiting { mv: Move::Sweep, at, .. } => {
-                let begin = at - beat_frames as f64 / HOP as f64;
-                (now >= begin).then(|| ((now - begin) / (at - begin).max(1.0)) as f32)
-            }
-            _ => None,
-        };
-        if sweeping.is_some() && m.sweep.is_none() {
-            m.sweep = Some(Sweep::new());
-        }
-
-        // ---- pull each square
-        let mut any = false;
-        let (targets, lows) = m.levels();
-        for d in 0..SQUARES {
-            let deck = &shared.decks[d];
-            let block = &mut scratch[d];
-            if !playing[d] {
-                block.fill(0.0);
-                m.decks[d].level *= 0.9;
-                m.decks[d].was_playing = false;
-                m.decks[d].tempo.idle(OUT);
-                continue;
-            }
-            if !std::mem::replace(&mut m.decks[d].was_playing, true) {
-                m.decks[d].tempo.reset();
-                m.decks[d].eq.reset();
-            }
-            any = true;
-            let rate = load_f32(&deck.rate) as f64;
-            let mut feed = deck.feed.lock().unwrap();
-            let real = pull(&mut feed, &mut m.decks[d], rate, block);
-            let ran_out = real == 0 && feed.ended && feed.buf.len() < 4;
-            drop(feed);
-            if ran_out {
-                deck.playing.store(false, Ordering::Relaxed);
-                shared.info.lock().unwrap().finished.push(d);
-            }
-            m.decks[d].tempo.feed(block);
-            m.lows[d] = lows[d];
-            let steps = [if lows[d] { 0 } else { EQ_KILL }, 0, 0];
-            m.decks[d].eq.run(block, steps);
-            let peak = block.iter().fold(0.0f64, |p, v| p.max(v.abs())) as f32;
-            m.decks[d].level = m.decks[d].level * 0.9 + peak * 0.1;
-        }
-        m.follow(&shared);
-
-        // ---- effects on the square being heard
-        let live = m.live;
-        if let Some((deck, at, stutter)) = m.stutter.as_mut() {
-            if now >= *at {
-                stutter.run(&mut scratch[*deck]);
-            }
-        }
-        if m.stutter.as_ref().is_some_and(|(_, _, s)| s.done()) {
-            m.stutter = None;
-        }
-        if let (Some(t), Some(sweep)) = (sweeping, m.sweep.as_mut()) {
-            sweep.run(&mut scratch[live], t);
-        }
-
+        let (targets, any) = m.run_block(&shared, &mut scratch, &mut mix);
         if !any {
             if started {
                 if let Some(out) = &out {
@@ -812,20 +945,6 @@ fn mixer_loop(shared: Arc<Shared>, volume: Box<dyn VolumeGetter + Send>) {
             started = true;
         }
 
-        // ---- sum, gliding each square's level across the block
-        mix.fill(0.0);
-        for d in 0..SQUARES {
-            let (from, to) = (m.gains[d], targets[d]);
-            if from == 0.0 && to == 0.0 {
-                continue;
-            }
-            for i in 0..OUT {
-                let g = (from + (to - from) * (i as f32 / OUT as f32)) as f64;
-                mix[2 * i] += scratch[d][2 * i] * g;
-                mix[2 * i + 1] += scratch[d][2 * i + 1] * g;
-            }
-        }
-        m.gains = targets;
         monitor.feed(&mix, &shared.hub, out.as_ref());
         let target = volume.attenuation_factor();
         let step = (target - gain) / OUT as f64;
@@ -882,7 +1001,7 @@ fn publish(shared: &Shared, m: &mut Mixer, gains: &[f32; SQUARES]) {
     let period = m.grid().map_or(HOPS_PER_SEC as f64 / 2.0, |g| g.period);
     info.next = match m.phase {
         Phase::Steady => None,
-        Phase::Waiting { to, mv, at } => Some(Next { to, mv, beats_left: ((at - now) / period).max(0.0) as f32, progress: None }),
+        Phase::Waiting { to, mv, at, .. } => Some(Next { to, mv, beats_left: ((at - now) / period).max(0.0) as f32, progress: None }),
         Phase::Moving { to, mv, start, length, .. } => {
             Some(Next { to, mv, beats_left: 0.0, progress: Some((((now - start) / length.max(1.0)) as f32).clamp(0.0, 1.0)) })
         }
@@ -898,54 +1017,75 @@ mod tests {
     }
 
     #[test]
-    fn a_switch_waits_for_the_music() {
+    fn a_switch_lands_on_the_beat() {
         // 120 BPM is a beat every 172.3 steps; beats at 1000 + k·period, bars from 1000.
         let p = HOPS_PER_SEC as f64 / 2.0;
         let g = grid(p, 1000.0 + p, Some(1000.0));
-        // Asked for just after a bar began.
         let now = 1010.0;
         // A cut goes on the very next beat.
-        assert!((when(now, g, Move::Cut) - (1000.0 + p)).abs() < 1e-6);
-        // A blend waits for the next bar.
-        assert!((when(now, g, Move::Blend) - (1000.0 + 4.0 * p)).abs() < 1e-6);
-        // Asked for a moment before a bar, a roll has no beat to roll in, so it takes the bar after.
-        let late = 1000.0 + 4.0 * p - 20.0;
-        assert!((when(late, g, Move::Roll) - (1000.0 + 8.0 * p)).abs() < 1e-6);
-        // But a cut still makes the next beat if there is time.
-        assert!((when(1000.0 + p - 60.0, g, Move::Cut) - (1000.0 + p)).abs() < 1e-6);
-        // Never in the past, and never too soon to be heard as meant.
-        for now in [900.0, 1000.0, 1172.0, 5000.0] {
+        assert!((when(now, now, g, Move::Cut) - (1000.0 + p)).abs() < 1e-6);
+        // A blend on the next half-bar: the one or the three, never a whole bar away.
+        assert!((when(now, now, g, Move::Blend) - (1000.0 + 2.0 * p)).abs() < 1e-6);
+        assert!((when(1000.0 + 2.5 * p, 1000.0 + 2.5 * p, g, Move::Blend) - (1000.0 + 4.0 * p)).abs() < 1e-6);
+        // A stutter gets a whole beat, starting on a beat.
+        let roll = when(now, now, g, Move::Roll);
+        assert!((roll - (1000.0 + 2.0 * p)).abs() < 1e-6);
+        assert!(roll - p >= now);
+        // A cut still makes the next beat if there is time.
+        assert!((when(1000.0 + p - 60.0, 1000.0 + p - 60.0, g, Move::Cut) - (1000.0 + p)).abs() < 1e-6);
+        // Never a long wait: at most two beats for anything.
+        for now in [900.0, 1000.0, 1172.0, 1300.0, 5000.0] {
             for mv in [Move::Cut, Move::Blend, Move::Roll, Move::Sweep] {
-                assert!(when(now, g, mv) >= now + HOPS_PER_SEC as f64 * 0.12 - 1e-6);
+                let at = when(now, now, g, mv);
+                assert!(at >= now + HOPS_PER_SEC as f64 * 0.12 - 1e-6);
+                assert!(at - now <= 2.0 * p + HOPS_PER_SEC as f64 * 0.25 + 1e-6, "{mv:?} from {now} waits {}", at - now);
             }
         }
+        // A square still held back to line up its bar is waited for.
+        assert!(when(now, now + 3.0 * p, g, Move::Cut) >= now + 3.0 * p);
         // With no beat to go by, it simply happens quickly.
-        let soon = when(500.0, None, Move::Blend);
+        let soon = when(500.0, 500.0, None, Move::Blend);
         assert!(soon > 500.0 && soon < 500.0 + HOPS_PER_SEC as f64 * 0.2);
     }
 
     #[test]
-    fn flicking_chops_and_staying_blends() {
+    fn flicking_chops_staying_blends_and_shift_stutters() {
         assert_eq!(choose(1.0, true, false), Move::Cut);
-        assert_eq!(choose(8.0, true, false), Move::Roll);
+        assert_eq!(choose(8.0, true, false), Move::Blend);
         assert_eq!(choose(40.0, true, false), Move::Blend);
         assert_eq!(choose(40.0, true, true), Move::Roll);
-        assert_eq!(choose(40.0, false, false), Move::Sweep);
+        assert_eq!(choose(40.0, false, true), Move::Sweep);
     }
 
     #[test]
-    fn a_blend_swaps_the_bass_half_way_and_never_dips() {
-        for i in 0..=100 {
-            let p = i as f32 / 100.0;
-            let ((out, out_low), (inn, in_low)) = blend_at(Move::Blend, p);
-            // Exactly one bass line at a time.
-            assert!(out_low != in_low, "at {p}");
-            // The sum of power never sags: no hole in the middle.
-            assert!(out * out + inn * inn >= 0.99, "at {p}: {out} {inn}");
+    fn a_switch_is_heard_the_moment_it_is_asked_for() {
+        // Just after the press, something has already changed.
+        let just = Stage::Coming(0.1);
+        let (_, inn, _) = shape(Move::Blend, just);
+        assert!(inn.gain > 0.0 && inn.eq[0] == EQ_KILL, "the new song's top end should be creeping in: {inn:?}");
+        for mv in [Move::Cut, Move::Sweep] {
+            assert!(shape(mv, just).2 > 0.0, "{mv:?}: the old song should be lifting");
         }
-        assert_eq!(blend_at(Move::Blend, 0.0), ((1.0, true), (0.0, false)));
-        assert_eq!(blend_at(Move::Blend, 1.0), ((0.0, false), (1.0, true)));
-        assert_eq!(blend_at(Move::Cut, 1.0), ((0.0, true), (1.0, true)));
+    }
+
+    #[test]
+    fn a_blend_swaps_the_bass_on_the_beat_and_is_short() {
+        // Before the landing only the old song has bass; from it, only the new one.
+        for i in 0..=10 {
+            let (out, inn, _) = shape(Move::Blend, Stage::Coming(i as f32 / 10.0));
+            assert_eq!((out.eq[0], inn.eq[0]), (0, EQ_KILL));
+            assert_eq!(out.gain, 1.0);
+            let (out, inn, _) = shape(Move::Blend, Stage::Landing(i as f32 / 10.0));
+            assert_eq!((out.eq[0], inn.eq[0]), (EQ_KILL, 0));
+            // No hole in the middle.
+            assert!(out.gain * out.gain + inn.gain * inn.gain >= 0.99, "at {i}");
+            assert!(inn.gain >= 0.5);
+        }
+        // Done means the old song is silent.
+        let (out, inn, _) = shape(Move::Blend, Stage::Landing(1.0));
+        assert_eq!((out.gain, inn.gain), (0.0, 1.0));
+        // Anything else is straight over on landing.
+        assert_eq!(shape(Move::Roll, Stage::Landing(0.0)), (SILENT, FULL, 0.0));
     }
 
     #[test]
@@ -1009,23 +1149,24 @@ mod tests {
         at(&mut m, (bar * 10.3) as u64);
         m.follow[1] = Follow::Locked(Lock::new(1, 1.0, 0));
         m.go(&shared, 1, false);
-        let Phase::Waiting { to: 1, mv: Move::Blend, at: when } = m.phase else { panic!("not waiting for a blend") };
-        assert!((when - bar * 11.0).abs() < 1.0, "lands at {when}, not on the bar");
-        // Nothing happens before then.
-        at(&mut m, (bar * 10.9) as u64);
+        let Phase::Waiting { to: 1, mv: Move::Blend, at: when, .. } = m.phase else { panic!("not waiting for a blend") };
+        assert!((when - bar * 10.5).abs() < 1.0, "lands at {when}, not on the half-bar");
+        // Before then the new song is creeping in, without its bass.
+        at(&mut m, (bar * 10.45) as u64);
         m.advance(&shared);
         assert!(matches!(m.phase, Phase::Waiting { .. }));
-        assert_eq!(m.levels().0, [1.0, 0.0, 0.0, 0.0]);
-        // On the bar it starts, and half-way both are up with one bass line between them.
-        at(&mut m, (bar * 11.0) as u64 + 1);
+        let (gains, eq, _) = m.levels();
+        assert_eq!(gains[0], 1.0);
+        assert!(gains[1] > 0.3 && eq[1][0] == EQ_KILL, "{gains:?} {eq:?}");
+        // On the half-bar the bass lines swap.
+        at(&mut m, (bar * 10.5) as u64 + 1);
         m.advance(&shared);
         assert!(matches!(m.phase, Phase::Moving { from: 0, to: 1, .. }));
-        at(&mut m, (bar * 11.5) as u64);
-        let (gains, lows) = m.levels();
-        assert!(gains[0] > 0.9 && gains[1] > 0.9, "{gains:?}");
-        assert!(lows[0] != lows[1]);
-        // A bar later square 2 is the one heard, and square 1 follows it.
-        at(&mut m, (bar * 12.0) as u64 + 2);
+        let (gains, eq, _) = m.levels();
+        assert!(gains[0] > 0.9 && gains[1] >= 0.5, "{gains:?}");
+        assert_eq!((eq[0][0], eq[1][0]), (EQ_KILL, 0));
+        // A beat later square 2 is the one heard, and square 1 follows it.
+        at(&mut m, (bar * 10.75) as u64 + 2);
         m.advance(&shared);
         assert!(matches!(m.phase, Phase::Steady));
         assert_eq!(m.live, 1);
@@ -1045,6 +1186,10 @@ mod tests {
         }
         m.go(&shared, 2, false);
         let Phase::Waiting { mv: Move::Cut, at: first, .. } = m.phase else { panic!("not a cut") };
+        // A moment later the old song is already lifting.
+        at(&mut m, 40);
+        assert!(m.levels().2 > 0.0);
+        at(&mut m, 10);
         assert!((first - beat).abs() < 1.0);
         // A different square before it lands: that one instead, still a cut.
         m.go(&shared, 3, false);
@@ -1062,6 +1207,225 @@ mod tests {
         assert!(matches!(m.phase, Phase::Waiting { to: 1, mv: Move::Sweep, .. }));
     }
 
+    /// A made-up song: a kick on every beat (harder on the one), a bell on
+    /// the one, a bass note and a chord held under it all. In its own key.
+    struct Song {
+        bpm: f64,
+        /// Seconds into the song at which its first bar starts.
+        offset: f64,
+        root: f64,
+        /// Frames made so far.
+        made: usize,
+    }
+
+    impl Song {
+        fn frames(&mut self, n: usize) -> Vec<f64> {
+            use std::f64::consts::TAU;
+            let beat = 60.0 / self.bpm;
+            let mut out = Vec::with_capacity(n * 2);
+            for _ in 0..n {
+                let t = self.made as f64 / RATE;
+                self.made += 1;
+                let since = (t - self.offset).rem_euclid(beat);
+                let count = ((t - self.offset) / beat).floor() as i64;
+                let one = count.rem_euclid(4) == 0;
+                let kick = if since < 0.15 { (TAU * 58.0 * since).sin() * (-since * 26.0).exp() * if one { 0.9 } else { 0.6 } } else { 0.0 };
+                // The beater's click, which is what the test listens for.
+                let click = if since < 0.004 { (TAU * 4_000.0 * since).sin() * 0.2 * (1.0 - since / 0.004) } else { 0.0 };
+                let bell = if one && since < 0.08 { (TAU * 2_000.0 * t).sin() * 0.25 * (1.0 - since / 0.08) } else { 0.0 };
+                // A bass note on each beat, as a bass line plays: started
+                // afresh, so it doesn't beat against the kick differently from
+                // one beat to the next.
+                let bass = (TAU * self.root * since).sin() * 0.18 * (1.0 - 0.4 * since / beat);
+                let pad = [2.0, 2.52, 3.0].iter().map(|k| (TAU * self.root * k * t).sin()).sum::<f64>() * 0.04;
+                // A tune in the middle of the range, a note a beat, as a voice would be.
+                let note = [8.0, 10.08, 12.0, 10.08][count.rem_euclid(4) as usize];
+                let lead = (TAU * self.root * note * t).sin() * 0.08 * (1.0 - (since / beat) * 0.5);
+                out.extend([kick + click + bell + bass + pad + lead; 2]);
+            }
+            out
+        }
+    }
+
+    /// How much of `hz` there is in each `ms` of `audio`, by Goertzel's method.
+    fn tone(audio: &[f64], hz: f64, ms: f64) -> Vec<f64> {
+        let hop = (RATE * ms / 1000.0) as usize;
+        let w = std::f64::consts::TAU * hz / RATE;
+        audio
+            .chunks(hop)
+            .map(|c| {
+                let (mut a, mut b) = (0.0, 0.0);
+                for v in c {
+                    let n = v + 2.0 * w.cos() * a - b;
+                    b = a;
+                    a = n;
+                }
+                (a * a + b * b - 2.0 * w.cos() * a * b) / (c.len() * c.len()) as f64
+            })
+            .collect()
+    }
+
+    /// Where the kicks fall in `audio` (mono), in seconds: their beaters' 4 kHz clicks.
+    fn kicks(audio: &[f64]) -> Vec<f64> {
+        let power = tone(audio, 4_000.0, 2.0);
+        let loudest = power.iter().fold(0.0f64, |a, b| a.max(*b));
+        let mut found: Vec<f64> = Vec::new();
+        for (i, p) in power.iter().enumerate() {
+            let at = i as f64 * 0.002;
+            if *p > loudest * 0.08 && found.last().is_none_or(|last| at - last > 0.02) {
+                found.push(at);
+            }
+        }
+        found
+    }
+
+    /// Where the bells (the ones) ring, in seconds: bursts of 2 kHz.
+    fn ones(audio: &[f64]) -> Vec<f64> {
+        let power = tone(audio, 2_000.0, 10.0);
+        let loudest = power.iter().fold(0.0f64, |a, b| a.max(*b));
+        let mut found: Vec<f64> = Vec::new();
+        for (i, p) in power.iter().enumerate() {
+            let at = i as f64 * 0.01;
+            if *p > loudest * 0.1 && found.last().is_none_or(|last| at - last > 0.3) {
+                found.push(at);
+            }
+        }
+        found
+    }
+
+    /// Play four made-up songs through the real mixer, switching between
+    /// them the ways a listener would, and listen to what comes out.
+    /// `cargo test --release quad::tests::a_set -- --ignored --nocapture`;
+    /// the result is saved to `target/squares.wav`.
+    #[test]
+    #[ignore]
+    fn a_set_sounds_like_one_piece_of_music() {
+        let shared = shared();
+        let mut songs = [
+            Song { bpm: 120.0, offset: 0.3, root: 55.0, made: 0 },
+            Song { bpm: 124.0, offset: 1.1, root: 65.4, made: 0 },
+            Song { bpm: 116.0, offset: 0.7, root: 82.4, made: 0 },
+            // Too slow to bend to the others: it has to be swept in.
+            Song { bpm: 92.0, offset: 0.2, root: 73.4, made: 0 },
+        ];
+        for d in &shared.decks {
+            let mut feed = d.feed.lock().unwrap();
+            feed.dur = (RATE * 600.0) as u64;
+            feed.loading = false;
+        }
+        let mut m = Mixer::new();
+        let mut scratch: [Vec<f64>; SQUARES] = std::array::from_fn(|_| vec![0.0; OUT * 2]);
+        let mut mix = vec![0.0; OUT * 2];
+        let mut heard: Vec<f64> = Vec::new();
+        // (second, square, shift): settle, blend, blend, flick back, stutter in, the far-off one.
+        let script = [(14.0, 1, false), (22.0, 2, false), (24.0, 0, false), (30.0, 2, true), (37.0, 3, false)];
+        let mut landed: Vec<(f64, usize)> = Vec::new();
+        let mut asked = 0;
+        let end = 42.0;
+        while (heard.len() as f64) < end * RATE {
+            let seconds = heard.len() as f64 / RATE;
+            for (d, song) in songs.iter_mut().enumerate() {
+                let mut feed = shared.decks[d].feed.lock().unwrap();
+                while feed.buf.len() < 16_384 {
+                    let more = song.frames(1024);
+                    feed.buf.extend(more);
+                    feed.pos += 1024;
+                }
+            }
+            if let Some(&(at, to, slam)) = script.get(asked) {
+                if seconds >= at {
+                    let sync: Vec<_> = m.follow.iter().map(|f| f.sync()).collect();
+                    m.go(&shared, to, slam);
+                    let how = match m.phase {
+                        Phase::Waiting { mv, .. } => mv.name(),
+                        _ => "nothing",
+                    };
+                    eprintln!("{seconds:.2} s: to square {} by {how}; in time then: {sync:?}", to + 1);
+                    asked += 1;
+                }
+            }
+            let live = m.live;
+            m.run_block(&shared, &mut scratch, &mut mix);
+            if m.live != live {
+                landed.push((seconds, m.live));
+            }
+            heard.extend(mix.chunks_exact(2).map(|p| p[0]));
+        }
+        save_wav("target/squares.wav", &heard);
+        eprintln!("switches done: {landed:?}");
+        let sync: Vec<_> = m.follow.iter().map(|f| f.sync()).collect();
+        eprintln!("in time with the last one: {sync:?}");
+        assert_eq!(landed.iter().map(|l| l.1).collect::<Vec<_>>(), [1, 2, 0, 2, 3], "not every switch happened");
+
+        // No gaps: every 10 ms has music in it.
+        let window = (RATE * 0.01) as usize;
+        let rms: Vec<f64> = heard.chunks(window).map(|c| (c.iter().map(|v| v * v).sum::<f64>() / c.len() as f64).sqrt()).collect();
+        let mut sorted = rms.clone();
+        sorted.sort_by(f64::total_cmp);
+        let typical = sorted[sorted.len() / 2];
+        let quietest = rms.iter().enumerate().skip(10).min_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+        eprintln!("quietest 10 ms: {:.3} at {:.2} s, typical {typical:.3}", quietest.1, quietest.0 as f64 * 0.01);
+        assert!(*quietest.1 > typical * 0.2, "a gap at {:.2} s", quietest.0 as f64 * 0.01);
+
+        // No clicks: the sound never jumps from one sample to the next by
+        // more than the music itself does.
+        let jumps: Vec<f64> = heard.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+        let normal = jumps[..(RATE * 12.0) as usize].iter().fold(0.0f64, |a, b| a.max(*b));
+        let (worst_at, worst) = jumps.iter().enumerate().fold((0, 0.0f64), |a, (i, j)| if *j > a.1 { (i, *j) } else { a });
+        eprintln!("largest step {worst:.4} at {:.3} s; a single song's is {normal:.4}", worst_at as f64 / RATE);
+        assert!(worst < normal * 2.5, "a click at {:.3} s", worst_at as f64 / RATE);
+
+        // In time: around each switch to a song that could be matched, no
+        // flams, two kicks 30 to 200 ms apart, which is what beats that
+        // don't line up sound like. (An echo's repeats fall on half-beats.)
+        let found = kicks(&heard);
+        for &(at, to) in &landed {
+            if to == 3 {
+                continue;
+            }
+            let near: Vec<f64> = found.iter().copied().filter(|k| (at - 2.5..at + 2.0).contains(k)).collect();
+            let gaps: Vec<f64> = near.windows(2).map(|w| w[1] - w[0]).collect();
+            eprintln!("switch to {} at {at:.2} s: kicks every {:?} ms", to + 1, gaps.iter().map(|g| (g * 1000.0).round()).collect::<Vec<_>>());
+            assert!(near.len() >= 6, "switch to square {} at {at:.2} s: the kicks went missing", to + 1);
+            let flams: Vec<&f64> = gaps.iter().filter(|g| (0.03..0.2).contains(*g)).collect();
+            assert!(flams.is_empty(), "switch to square {} at {at:.2} s: flams {flams:?}", to + 1);
+        }
+
+        // On the one: the bells, a bar apart, carry on a bar apart across switches.
+        let bells = ones(&heard);
+        for (k, &(at, to)) in landed.iter().enumerate() {
+            // Not the far-off song, nor the stutter, which repeats the one on purpose.
+            if to == 3 || script[k].2 {
+                continue;
+            }
+            let near: Vec<f64> = bells.iter().copied().filter(|b| (at - 4.5..at + 4.5).contains(b)).collect();
+            let bars: Vec<f64> = near.windows(2).map(|w| (w[1] - w[0]) / 2.0).collect();
+            eprintln!("switch to {} at {at:.2} s: bells every {:?} bars", to + 1, bars.iter().map(|b| (b * 100.0).round() / 100.0).collect::<Vec<_>>());
+            assert!(bars.iter().all(|b| (b - b.round()).abs() < 0.06 && b.round() >= 1.0), "the bars slipped at {at:.2} s: {bars:?}");
+        }
+    }
+
+    fn save_wav(path: &str, mono: &[f64]) {
+        let mut out = Vec::with_capacity(44 + mono.len() * 2);
+        let data = (mono.len() * 2) as u32;
+        out.extend(b"RIFF");
+        out.extend((36 + data).to_le_bytes());
+        out.extend(b"WAVEfmt ");
+        out.extend(16u32.to_le_bytes());
+        out.extend(1u16.to_le_bytes());
+        out.extend(1u16.to_le_bytes());
+        out.extend((RATE as u32).to_le_bytes());
+        out.extend((RATE as u32 * 2).to_le_bytes());
+        out.extend(2u16.to_le_bytes());
+        out.extend(16u16.to_le_bytes());
+        out.extend(b"data");
+        out.extend(data.to_le_bytes());
+        for v in mono {
+            out.extend(((v.clamp(-1.0, 1.0) * 32_000.0) as i16).to_le_bytes());
+        }
+        let _ = std::fs::write(path, out);
+    }
+
     #[test]
     fn the_grid_round() {
         assert_eq!((neighbour(0, true), neighbour(0, false)), (1, 2));
@@ -1076,3 +1440,4 @@ mod tests {
         assert_eq!(next_round(1, 2), 2);
     }
 }
+

@@ -102,24 +102,26 @@ other Spotify devices won't show what they are playing.
 
 `4` and four songs start at once, one in each quarter of the screen, each
 printed like a pop-art poster in its own loud colours. You hear one of
-them. The arrow keys pick another, and riff brings it in when the music
-says so, not the instant you press:
+them. The arrow keys pick another: you hear it start to happen straight
+away, and it lands on the beat.
 
 - All four play the whole time. The three you can't hear run underneath
   the one you can, bent to its tempo and slid onto its beats, and onto its
   bars where riff can tell which beat is the one. So whichever you pick is
-  already in time.
-- The switch lands on the next bar. How it goes over depends on how long
-  you stayed: after a while, a blend over a bar with the bass lines
-  swapping half-way; sooner, the old song's last beat stutters into the new
-  one; flick between squares and it chops between them on the beat. A song
-  too far apart in tempo to match is swept in instead.
+  already in time. (It takes ten seconds or so after starting for the
+  squares to find their beat; a square that is in time shows ⇄.)
+- Settle on a song for a few beats and the next switch is a blend: the new
+  song's top end creeps in under the old one, then on the next half-bar the
+  bass lines swap and the old song bows out over a beat.
+- Flick between squares and each switch is a cut on the next beat, with
+  the old song lifting into it and an echo of it trailing off underneath.
+- A song too far apart in tempo to match is brought in with an echo-out.
 - The square coming in shows **NEXT** and a dot for each beat to go.
 
 | | |
 |---|---|
 | `←` `→` `↑` `↓` | the next song (click a square too) |
-| shift+arrow | drop it: stutter, then in on the one |
+| shift+arrow | drop it: the old song stutters for a beat, then the new one |
 | `enter` | stutter the song playing for a beat |
 | `tab` | a square chosen for you |
 | `n` `p` | round the squares |
