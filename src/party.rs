@@ -112,21 +112,28 @@ pub struct Music<'a> {
     pub bass: f32,
     /// Animation time, running faster when the music is louder.
     pub clock: f32,
+    /// The colours of the cover playing: its accent, and a deep shade of it.
+    pub accent: Rgb,
+    pub shade: Rgb,
 }
 
 impl Music<'_> {
     /// The spectrum at `t`, 0 for the lowest band and 1 for the highest.
     fn band(&self, t: f32) -> f32 {
-        self.bars[((t.clamp(0.0, 1.0) * (BANDS - 1) as f32) as usize).min(BANDS - 1)]
+        let at = t.clamp(0.0, 1.0) * (BANDS - 1) as f32;
+        let (i, f) = (at as usize, at.fract());
+        let next = (i + 1).min(BANDS - 1);
+        self.bars[i] * (1.0 - f) + self.bars[next] * f
     }
 }
 
-/// What a scene puts at one cell: a shift of hue, extra light, and maybe a
-/// glyph for an empty cell.
+/// What a scene puts at one point: how much light, which of the two
+/// colours it is in (0 the cover's own, 1 its complement), and for an
+/// empty cell, perhaps a glyph.
 #[derive(Clone, Copy, Default)]
-struct Glow {
-    hue: f32,
-    light: f32,
+struct Light {
+    level: f32,
+    tint: f32,
     glyph: Option<char>,
 }
 
@@ -143,12 +150,13 @@ fn hash(a: u32, b: u32) -> f32 {
 /// Characters that look like falling code, and that every monospace font has.
 const RAIN: &[char] = &['0', '1', '2', '5', '7', '9', 'Z', 'Ξ', 'Σ', 'Λ', 'Δ', 'Π', 'Ω', 'λ', 'ψ', '+', '*', '=', ':', '¦', '╎'];
 
-/// Cell `(cx, cy)` of a `w` by `h` screen, in `scene`.
-fn glow(scene: Scene, cx: usize, cy: usize, w: usize, h: usize, m: &Music) -> Glow {
-    let (x, y) = ((cx as f32 + 0.5) / w as f32, (cy as f32 + 0.5) / h as f32);
-    // Cells are about twice as tall as they are wide: distances in widths.
-    let aspect = w as f32 / h as f32 / 2.0;
-    let (dx, dy) = ((x - 0.5) * aspect, y - 0.5);
+/// The light of `scene` at pixel `px`, `py` of a screen `w` pixels wide and
+/// `h` tall (two pixels to a cell, one above the other, about square).
+fn light(scene: Scene, px: f32, py: f32, w: f32, h: f32, m: &Music) -> Light {
+    let (x, y) = (px / w, py / h);
+    // Distances in pixels, which are about as tall as they are wide.
+    let (dx, dy) = (px - w / 2.0, py - h / 2.0);
+    let unit = w.min(h) / 2.0;
     let tau = std::f32::consts::TAU;
     match scene {
         Scene::Edges => {
@@ -156,94 +164,158 @@ fn glow(scene: Scene, cx: usize, cy: usize, w: usize, h: usize, m: &Music) -> Gl
             // edge, highs towards the corners. `across` and `down` run from 0
             // on the centre line to 1 at the edge. The side bars stop sooner,
             // so as to look as deep as the top and bottom ones.
-            const REACH_TALL: f32 = 0.9;
-            const REACH_WIDE: f32 = 0.5;
             let across = (x - 0.5).abs() * 2.0;
             let down = (y - 0.5).abs() * 2.0;
-            let under = (m.band(across) * REACH_TALL - (1.0 - down)).max(m.band(down) * REACH_WIDE - (1.0 - across));
-            let light = if under > 0.0 { 0.07 + 0.11 * (1.0 - under.min(1.0)) } else { 0.0 };
-            Glow { hue: across.max(down) * 110.0 + across.min(down) * 50.0, light, glyph: None }
+            // Separate bars, with a gap between each: 24 from the middle of
+            // the top and bottom edges out to the corners, 10 on the sides.
+            let bar_of = |t: f32, n: f32| {
+                let k = (t * n).floor();
+                ((t * n).fract() < 0.7).then_some(((k + 0.5) / n).min(1.0))
+            };
+            let (tall, wide) = (bar_of(across, 24.0).map_or(0.0, |t| m.band(t)), bar_of(down, 10.0).map_or(0.0, |t| m.band(t)));
+            let (under, bar) = {
+                let (a, b) = (tall * 0.9 - (1.0 - down), wide * 0.5 - (1.0 - across));
+                if a > b { (a, tall) } else { (b, wide) }
+            };
+            // Brightest at the tip of each bar, with a glow beyond it; a bar
+            // with nothing in it has no tip to glow.
+            let strength = (bar * 5.0).min(1.0);
+            let level = if under > 0.0 { 0.35 + 0.55 * (-under * 5.0).exp() } else { 0.75 * (under * 28.0).exp() } * strength;
+            Light { level, tint: across.max(down).powi(2), glyph: None }
         }
         Scene::Tunnel => {
-            // Rectangles shaped like the screen, rushing outward, leaping on each beat.
-            let r = ((x - 0.5).abs() * 2.0).max((y - 0.5).abs() * 2.0);
+            // Rounded rectangles of light rushing outward, leaping on each beat.
+            let (nx, ny) = (dx / (w / 2.0), dy / (h / 2.0));
+            let r = (nx.powi(4) + ny.powi(4)).powf(0.25);
             let phase = r * 6.0 - m.clock * 1.4 - m.beats as f32 * 0.5 - (1.0 - m.beat) * 0.5;
-            let ring = phase.rem_euclid(1.0);
-            let lit = if ring < 0.38 { 1.0 - ring / 0.38 } else { 0.0 };
-            Glow { hue: phase.floor() * 47.0, light: lit * (0.06 + 0.13 * r) + m.band(r) * 0.05, glyph: None }
+            let off = (phase - phase.round()).abs();
+            let ring = (-(off / 0.07).powi(2)).exp();
+            let level = ring * (0.25 + 0.75 * r.min(1.0)) + 0.06 * r + m.band(r.min(1.0)) * 0.1;
+            Light { level, tint: (phase.round() as i64).rem_euclid(2) as f32, glyph: None }
         }
         Scene::Plasma => {
+            // Slow waves running into each other, like a lava lamp.
+            let (u, v) = (dx / unit, dy / unit);
             let t = m.clock * 0.9;
-            let r = (dx * dx + dy * dy).sqrt();
-            let v = (dx * 9.0 + t).sin()
-                + (dy * 7.0 - t * 1.3).sin()
-                + ((dx + dy) * 6.0 + t * 0.7).sin()
-                + (r * (12.0 + 6.0 * m.bass) - t * 2.0).sin();
-            let v = v / 8.0 + 0.5;
-            Glow { hue: v * 160.0, light: 0.02 + 0.16 * v * v + 0.05 * m.beat * v, glyph: None }
+            let r = (u * u + v * v).sqrt();
+            let wave = (u * 2.2 + t).sin() + (v * 1.8 - t * 1.3).sin() + ((u + v) * 1.6 + t * 0.7).sin() + (r * (3.0 + 1.5 * m.bass) - t * 2.0).sin();
+            let v = wave / 8.0 + 0.5;
+            Light { level: 0.08 + 1.05 * v * v * v + 0.15 * m.beat * v, tint: ((v * tau + t * 0.3).sin() * 0.5 + 0.5), glyph: None }
         }
         Scene::Lasers => {
-            // From two points on the floor, beams sweeping back and forth.
-            let mut best = Glow::default();
+            // Thin beams from two points on the floor, sweeping back and
+            // forth through a haze, each with a soft halo.
+            let mut level = 0.04 + 0.03 * hash((px / 6.0) as u32, (py / 6.0) as u32 + (m.clock * 2.0) as u32);
+            let mut tint = 0.0;
+            let mut strongest = 0.0;
             for k in 0..6 {
-                let from = if k % 2 == 0 { 0.25 } else { 0.75 };
-                let (bx, by) = ((x - from) * aspect, y - 1.05);
+                let from = if k % 2 == 0 { w * 0.22 } else { w * 0.78 };
+                let (bx, by) = (px - from, py - h * 1.02);
                 let angle = by.atan2(bx);
                 let aim = -tau / 4.0 + (m.clock * 0.6 + k as f32 * 1.7).sin() * 0.85;
-                let off = (angle - aim + tau / 2.0).rem_euclid(tau) - tau / 2.0;
-                let width = 0.018 + 0.02 * m.beat;
-                let lit = (-(off / width).powi(2)).exp() * (0.12 + 0.12 * m.beat);
-                if lit > best.light {
-                    best = Glow { hue: k as f32 * 60.0, light: lit, glyph: None };
+                let off = ((angle - aim + tau / 2.0).rem_euclid(tau) - tau / 2.0).abs();
+                let core = (-(off / (0.006 + 0.004 * m.beat)).powi(2)).exp();
+                let halo = (-(off / 0.05).powi(2)).exp() * 0.22;
+                let beam = (core * 0.9 + halo) * (0.6 + 0.4 * m.beat);
+                level += beam;
+                if beam > strongest {
+                    strongest = beam;
+                    tint = (k % 2) as f32;
                 }
             }
-            // A little smoke for them to cut through.
-            best.light += 0.03 * hash(cx as u32 / 3, cy as u32 + (m.clock * 2.0) as u32);
-            best
+            Light { level, tint, glyph: None }
         }
         Scene::Rain => {
-            // Each column falls at the pace of its part of the spectrum; about
-            // half the columns are falling at any time.
+            // About half the columns carry a stream falling at the pace of
+            // its part of the spectrum, glowing behind its head.
+            let col = (px.max(0.0)) as u32;
             let band = m.band(x);
-            if hash(cx as u32, 5) > 0.55 {
-                return Glow { hue: x * 120.0, light: 0.0, glyph: None };
+            if hash(col, 5) > 0.5 {
+                return Light { level: 0.03, tint: 0.0, glyph: None };
             }
             let speed = 0.25 + 0.9 * band;
-            let head = (hash(cx as u32, 7) + m.clock * speed * 0.25).rem_euclid(1.0) * 1.5 - 0.25;
+            let head = (hash(col, 7) + m.clock * speed * 0.25).rem_euclid(1.0) * 1.5 - 0.25;
             let behind = head - y;
             let trail = 0.3 + 0.2 * band;
             if !(0.0..trail).contains(&behind) {
-                return Glow { hue: x * 120.0, light: 0.0, glyph: None };
+                return Light { level: 0.03, tint: 0.0, glyph: None };
             }
             let fade = 1.0 - behind / trail;
-            let pick = (hash(cx as u32 * 131 + cy as u32, (m.clock * 6.0) as u32) * RAIN.len() as f32) as usize;
-            Glow { hue: x * 120.0, light: 0.04 + 0.12 * fade * fade, glyph: Some(RAIN[pick.min(RAIN.len() - 1)]) }
+            let at_head = behind < 0.03;
+            let pick = (hash(col * 131 + (py / 2.0) as u32, (m.clock * 6.0) as u32) * RAIN.len() as f32) as usize;
+            Light {
+                level: if at_head { 1.0 } else { 0.08 + 0.55 * fade * fade },
+                tint: band,
+                glyph: (fade > 0.35).then(|| RAIN[pick.min(RAIN.len() - 1)]),
+            }
         }
         Scene::Warp => {
-            // Stars on spokes, flying outward; a streak behind each.
-            let r = (dx * dx + dy * dy).sqrt() / (0.5 * aspect.max(1.0));
-            let spokes = 200.0;
+            // Stars on spokes from the middle, flying outward, each with a
+            // streak behind it that lengthens as it speeds up.
+            let r = (dx * dx + dy * dy).sqrt() / unit;
+            let spokes = 260.0;
             let spoke = ((dy.atan2(dx) / tau + 0.5) * spokes) as u32;
             let speed = 0.15 + 0.35 * m.bass + 0.25 * m.beat;
-            // Two stars to a spoke, at different points of their flight.
-            let mut best = Glow { hue: r * 90.0 + 200.0, light: 0.03 * (1.0 - r).max(0.0), glyph: None };
+            let mut best = Light { level: 0.05 * (1.0 - r * 0.5).max(0.0), tint: 0.0, glyph: None };
             for k in 0..2 {
+                if hash(spoke, 20 + k) > 0.85 {
+                    continue;
+                }
                 let at = (hash(spoke, 3 + k) + m.clock * speed * (0.8 + 0.4 * hash(spoke, 9 + k))).rem_euclid(1.0);
-                let star = at * at * 1.3;
-                // The streak lengthens as the star speeds up towards the edge.
-                let streak = 0.04 + 0.3 * speed * star;
+                let star = at * at * 1.6;
+                let streak = 0.04 + 0.35 * speed * star;
                 let behind = star - r;
                 if (0.0..streak).contains(&behind) {
-                    let head = behind < streak * 0.25;
-                    let glyph = if !head { '·' } else if star > 0.7 { '✦' } else { '•' };
-                    let light = 0.06 + 0.14 * (1.0 - behind / streak) * star.min(1.0);
-                    if light > best.light {
-                        best = Glow { hue: spoke as f32 * 3.0, light, glyph: Some(glyph) };
+                    let level = 0.3 + 0.95 * (1.0 - behind / streak).powi(2) * (0.3 + star).min(1.0);
+                    if level > best.level {
+                        let head = behind < streak * 0.15 && star > 0.5;
+                        best = Light { level, tint: hash(spoke, 30), glyph: head.then_some(if star > 1.0 { '✦' } else { '•' }) };
                     }
                 }
             }
             best
         }
+    }
+}
+
+/// From darkness through the colour to white: light turned into colour.
+struct Ramp {
+    stops: [[f32; 3]; 2],
+    dark: [f32; 3],
+}
+
+impl Ramp {
+    /// The cover's accent and its complement, over a deep shade of the cover.
+    fn new(m: &Music, swapped: bool) -> Self {
+        let (h, s, l) = art::hsl(m.accent);
+        let (h, s) = (h, s.max(0.55));
+        let main = art::hsl_to_rgb(h, s, l.clamp(0.5, 0.62));
+        // The second colour drifts slowly round the wheel as the beats go by.
+        let other = art::hsl_to_rgb(h + 150.0 + (m.beats as f32 * 1.5) % 60.0, s, l.clamp(0.5, 0.62));
+        let f = |c: Rgb| [c.0 as f32, c.1 as f32, c.2 as f32];
+        let dark = art::mix(m.shade, (0, 0, 0), 0.35);
+        let stops = if swapped { [f(other), f(main)] } else { [f(main), f(other)] };
+        Self { stops, dark: f(dark) }
+    }
+
+    fn colour(&self, level: f32, tint: f32) -> Rgb {
+        let tint = tint.clamp(0.0, 1.0);
+        let c: [f32; 3] = std::array::from_fn(|i| self.stops[0][i] + (self.stops[1][i] - self.stops[0][i]) * tint);
+        let level = level.clamp(0.0, 1.3);
+        let lerp = |a: [f32; 3], b: [f32; 3], t: f32| -> [f32; 3] { std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t.clamp(0.0, 1.0)) };
+        let deep: [f32; 3] = std::array::from_fn(|i| c[i] * 0.32);
+        let out = if level < 0.4 {
+            lerp(self.dark, deep, level / 0.4)
+        } else if level < 0.75 {
+            lerp(deep, c, (level - 0.4) / 0.35)
+        } else {
+            // Past full colour, towards white: the hot centre of the light.
+            lerp(c, [255.0; 3], (level - 0.75) / 0.55 * 0.8)
+        };
+        // A few steps per channel, so cells that haven't really changed
+        // are not sent to the terminal again on every frame.
+        let q = |v: f32| ((v.clamp(0.0, 255.0) / 4.0).round() * 4.0).min(255.0) as u8;
+        (q(out[0]), q(out[1]), q(out[2]))
     }
 }
 
@@ -258,35 +330,51 @@ fn rgb(c: Rgb) -> Color {
     Color::Rgb(c.0, c.1, c.2)
 }
 
-/// Paint party mode over the finished frame in `area`. `base` is the
-/// interface's own background, which tells raised panels from the page;
-/// cover art in `art` keeps its own colours and gets a frame of light.
-pub fn paint(buf: &mut Buffer, area: Rect, base: Rgb, art: &[Rect], rave: &Rave, m: &Music) {
+/// Paint party mode over the finished frame in `area`. Empty cells become
+/// two pixels of the scene each; cells with something in them keep it,
+/// lit clearly, over a darkened band so it stays readable. Cover art in
+/// `art` keeps its own colours and gets a frame of light.
+pub fn paint(buf: &mut Buffer, area: Rect, art: &[Rect], rave: &Rave, m: &Music) {
     let (w, h) = (area.width as usize, area.height as usize);
     if w == 0 || h == 0 {
         return;
     }
-    let beat = m.beat;
-    let base_hue = m.beats as f32 * 47.0 + m.clock * 28.0;
-    let base_luma = luma(rgb(base), 0.05);
-    // Colours are snapped to steps so cells that haven't really changed are
-    // not resent to the terminal on every frame.
-    let step = |v: f32, n: f32| (v * n).round() / n;
-    let in_art = |col: u16, row: u16| art.iter().any(|r| col >= r.x && col < r.right() && row >= r.y && row < r.bottom());
-    // Around each cover, a ring of cells.
-    let by_art = |col: u16, row: u16| {
-        art.iter().any(|r| col + 1 >= r.x && col <= r.right() && row + 1 >= r.y && row <= r.bottom())
-    };
+    let ramp = Ramp::new(m, rave.drops % 2 == 1);
+    let (pw, ph) = (w as f32, h as f32 * 2.0);
+    let flash = rave.drop * rave.drop * 0.5;
+    let lift = m.beat * 0.06 + flash;
     let mixing = rave.change < 1.0;
-    let flash = rave.drop * rave.drop * 0.12;
-    // Which cells were empty to begin with. A scene's glyphs go only where
-    // both neighbours are empty too, so they never sit between two words.
+    let at = |px: f32, py: f32| {
+        let mut l = light(rave.scene, px, py, pw, ph, m);
+        if mixing {
+            // Fading from the last scene into this one.
+            let was = light(rave.last, px, py, pw, ph, m);
+            let t = rave.change;
+            l = Light { level: was.level + (l.level - was.level) * t, tint: was.tint + (l.tint - was.tint) * t, glyph: if t > 0.5 { l.glyph } else { was.glyph } };
+        }
+        Light { level: l.level + lift, ..l }
+    };
+    let in_art = |col: u16, row: u16| art.iter().any(|r| col >= r.x && col < r.right() && row >= r.y && row < r.bottom());
+    let by_art = |col: u16, row: u16| art.iter().any(|r| col + 1 >= r.x && col <= r.right() && row + 1 >= r.y && row <= r.bottom());
+    // Which cells had nothing in them, before any were changed: a scene's
+    // glyphs go only where both neighbours are empty too, so they never sit
+    // between two words, and never on the bottom line, with the key hints.
     let blank: Vec<bool> = (0..w * h)
         .map(|i| buf.cell((area.x + (i % w) as u16, area.y + (i / w) as u16)).is_none_or(|c| c.symbol() == " "))
         .collect();
-    let open = |x: usize, y: usize| {
-        // Not on the bottom line, where the key hints are.
-        y + 1 < h && blank[y * w + x] && (x == 0 || blank[y * w + x - 1]) && (x + 1 == w || blank[y * w + x + 1])
+    // Empty, with nothing either side: open sky, where the scene shows. A
+    // space beside writing (between two words, say) belongs to the writing.
+    let sky = |x: usize, y: usize| blank[y * w + x] && (x == 0 || blank[y * w + x - 1]) && (x + 1 == w || blank[y * w + x + 1]);
+    let open = |x: usize, y: usize| y + 1 < h && sky(x, y);
+    let main = ramp.colour(0.75, 0.0);
+    let text_tint = |strength: f32| -> Rgb {
+        if strength > 0.8 {
+            art::mix((255, 255, 255), main, 0.1)
+        } else if strength > 0.42 {
+            art::mix((255, 255, 255), main, 0.4)
+        } else {
+            art::mix((200, 200, 200), main, 0.6)
+        }
     };
 
     for y in 0..h {
@@ -296,40 +384,38 @@ pub fn paint(buf: &mut Buffer, area: Rect, base: Rgb, art: &[Rect], rave: &Rave,
             if in_art(col, row) {
                 continue;
             }
+            let (px, top_y) = (x as f32 + 0.5, y as f32 * 2.0 + 0.5);
+            let (top, bottom) = (at(px, top_y), at(px, top_y + 1.0));
             let Some(cell) = buf.cell_mut((col, row)) else { continue };
-            let mut g = glow(rave.scene, x, y, w, h, m);
-            if mixing {
-                // Fading from the last scene into this one.
-                let was = glow(rave.last, x, y, w, h, m);
-                let t = rave.change;
-                g = Glow { hue: was.hue + (g.hue - was.hue) * t, light: was.light + (g.light - was.light) * t, glyph: if t > 0.5 { g.glyph } else { was.glyph } };
-            }
-            let hue = step((base_hue + g.hue) / 360.0, 40.0) * 360.0;
-            let raised = luma(cell.bg, base_luma) > base_luma + 0.02;
-            let mut light = 0.05 + beat * 0.075 + g.light + flash;
-            if raised {
-                light += 0.07;
-            }
             if by_art(col, row) {
-                // The frame round the cover: brightest on the beat.
-                light += 0.12 + 0.12 * beat;
-            }
-            let bg = art::hsl_to_rgb(hue, 0.78, step(light.min(0.4), 48.0));
-            cell.set_bg(rgb(bg));
-
-            if cell.symbol() != " " {
-                let strength = luma(cell.fg, 0.9);
-                let fg = if strength > 0.80 {
-                    art::mix((255, 255, 255), art::hsl_to_rgb(hue + 40.0, 1.0, 0.8), 0.18)
-                } else if strength > 0.42 {
-                    art::hsl_to_rgb(hue + 160.0, 0.95, 0.74)
+                // The frame round the cover: a band of light, brightest on the beat.
+                let c = ramp.colour(0.85 + 0.35 * m.beat, 0.0);
+                if cell.symbol() == " " {
+                    cell.set_char(' ').set_bg(rgb(c));
                 } else {
-                    art::hsl_to_rgb(hue + 160.0, 0.7, 0.58)
-                };
-                cell.set_fg(rgb(fg));
-            } else if let Some(glyph) = g.glyph.filter(|_| open(x, y)) {
-                // Only into empty cells: the scene never covers anything up.
-                cell.set_char(glyph).set_fg(rgb(art::hsl_to_rgb(hue + 120.0, 0.9, 0.55 + g.light)));
+                    cell.set_bg(rgb(c)).set_fg(rgb((10, 10, 10)));
+                }
+                continue;
+            }
+            if sky(x, y) {
+                match top.glyph.or(bottom.glyph).filter(|_| open(x, y)) {
+                    Some(glyph) => {
+                        let bright = top.level.max(bottom.level);
+                        cell.set_char(glyph)
+                            .set_fg(rgb(ramp.colour(bright.max(0.9), top.tint)))
+                            .set_bg(rgb(ramp.colour(bright * 0.35, top.tint)));
+                    }
+                    None => {
+                        cell.set_char('▀').set_fg(rgb(ramp.colour(top.level, top.tint))).set_bg(rgb(ramp.colour(bottom.level, bottom.tint)));
+                    }
+                }
+            } else {
+                // Something is written here: a darkened band behind it, and
+                // the writing itself clear and light.
+                let strength = luma(cell.fg, 0.9);
+                // Never brighter than a dim glow, however bright the scene.
+                let behind = ramp.colour(((top.level + bottom.level) * 0.5 * 0.45).min(0.3), top.tint);
+                cell.set_bg(rgb(behind)).set_fg(rgb(text_tint(strength)));
             }
         }
     }
@@ -348,21 +434,21 @@ pub fn paint(buf: &mut Buffer, area: Rect, base: Rgb, art: &[Rect], rave: &Rave,
         }
     };
 
-    // Sway: rows slide sideways in a travelling wave that kicks on the beat.
-    // The bottom line stays put so the key hints remain readable.
-    if beat > 0.05 {
+    // On a strong beat, rows give a little nudge sideways, in a wave down
+    // the screen. The bottom line stays put so the key hints remain readable.
+    if m.beat > 0.6 {
         for y in 0..h.saturating_sub(1) {
-            let shift = ((m.clock * 2.4 + y as f32 * 0.55).sin() * (0.2 + 2.3 * beat)).round() as isize;
+            let shift = ((m.clock * 2.4 + y as f32 * 0.55).sin() * 1.4 * m.beat).round() as isize;
             shift_row(buf, y, shift);
         }
     }
 
     // A drop glitches a few rows sideways, by a few cells, for a moment.
-    if rave.drop > 0.55 {
+    if rave.drop > 0.6 {
         let seed = rave.drops * 977 + (rave.drop * 12.0) as u32;
-        for k in 0..4 {
+        for k in 0..3 {
             let y = (hash(seed, k) * h.saturating_sub(1) as f32) as usize;
-            let shift = ((hash(seed, k + 10) - 0.5) * 24.0) as isize;
+            let shift = ((hash(seed, k + 10) - 0.5) * 16.0) as isize;
             shift_row(buf, y, shift);
         }
     }
@@ -425,16 +511,61 @@ mod tests {
         assert_eq!(rave.drops, 1);
     }
 
+    fn lit(scene: Scene, accent: Rgb, text: &str) -> Buffer {
+        let bars = [0.6; BANDS];
+        let m = Music { bars: &bars, beat: 0.0, beats: 3, bass: 0.5, clock: 4.0, accent, shade: (20, 8, 24) };
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 24));
+        for row in [3, 8, 12, 20] {
+            buf.set_string(10, row, text, ratatui::style::Style::default().fg(Color::Rgb(150, 150, 150)));
+        }
+        let rave = Rave { scene, last: scene, change: 1.0, ..Default::default() };
+        paint(&mut buf, Rect::new(0, 0, 80, 24), &[], &rave, &m);
+        buf
+    }
+
+    #[test]
+    fn writing_stays_readable_in_every_scene() {
+        for scene in Scene::ORDER {
+            let buf = lit(scene, (230, 80, 160), "Every signal turning green in this town");
+            for cell in buf.content.iter().filter(|c| c.symbol() != " " && c.symbol() != "▀") {
+                let (fg, bg) = (luma(cell.fg, 0.0), luma(cell.bg, 1.0));
+                assert!(fg - bg > 0.45, "{scene:?}: '{}' at {fg:.2} on {bg:.2}", cell.symbol());
+            }
+        }
+    }
+
+    #[test]
+    fn the_colours_follow_the_cover() {
+        // A scene's light at full strength, in its first colour, is the
+        // cover's own hue; its second colour is well round the wheel from it.
+        for accent in [(220, 40, 40), (40, 80, 230), (60, 200, 90), (230, 180, 40)] {
+            let bars = [0.0; BANDS];
+            let m = Music { bars: &bars, beat: 0.0, beats: 0, bass: 0.0, clock: 0.0, accent, shade: (20, 8, 24) };
+            let ramp = Ramp::new(&m, false);
+            let (want, _, _) = art::hsl(accent);
+            let (got, _, _) = art::hsl(ramp.colour(0.75, 0.0));
+            let apart = |a: f32, b: f32| ((a - b).rem_euclid(360.0)).min((b - a).rem_euclid(360.0));
+            assert!(apart(want, got) < 12.0, "{accent:?} lit at hue {got}, not {want}");
+            let (other, _, _) = art::hsl(ramp.colour(0.75, 1.0));
+            assert!(apart(want, other) > 90.0, "{accent:?}: its second colour is too close");
+            // The dark is dark, and the brightest nearly white.
+            assert!(luma(rgb(ramp.colour(0.0, 0.0)), 1.0) < 0.1);
+            assert!(luma(rgb(ramp.colour(1.3, 0.0)), 0.0) > 0.85);
+            // A drop swaps the two round.
+            assert_eq!(Ramp::new(&m, true).colour(0.75, 0.0), ramp.colour(0.75, 1.0));
+        }
+    }
+
     #[test]
     fn every_scene_draws_something_and_covers_nothing() {
         let bars = [0.5; BANDS];
-        let m = Music { bars: &bars, beat: 0.6, beats: 3, bass: 0.5, clock: 4.0 };
+        let m = Music { bars: &bars, beat: 0.6, beats: 3, bass: 0.5, clock: 4.0, accent: (230, 80, 160), shade: (20, 8, 24) };
         for scene in Scene::ORDER {
             let (w, h) = (80, 24);
             let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
             buf.set_string(10, 5, "Midnight Drive", ratatui::style::Style::default().fg(Color::Rgb(230, 230, 230)));
             let rave = Rave { scene, last: scene, change: 1.0, ..Default::default() };
-            paint(&mut buf, Rect::new(0, 0, w, h), (12, 12, 12), &[], &rave, &Music { beat: 0.0, ..m });
+            paint(&mut buf, Rect::new(0, 0, w, h), &[], &rave, &Music { beat: 0.0, ..m });
             let lights: std::collections::HashSet<_> = buf.content.iter().map(|c| c.bg).collect();
             assert!(lights.len() > 4, "{scene:?} is flat");
             let text: String = (10..24).map(|x| buf[(x, 5)].symbol().to_string()).collect();

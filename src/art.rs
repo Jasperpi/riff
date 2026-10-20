@@ -831,6 +831,11 @@ fn rgb_to_hsl((r, g, b): Rgb) -> (f32, f32, f32) {
     (h * 60.0, s.min(1.0), l)
 }
 
+/// A colour's hue (degrees), saturation and lightness (0..1).
+pub fn hsl(c: Rgb) -> (f32, f32, f32) {
+    rgb_to_hsl(c)
+}
+
 pub fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Rgb {
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
     let hp = h.rem_euclid(360.0) / 60.0;

@@ -177,8 +177,11 @@ riff listens to what it is playing and finds the beat.
   scene that changes every four bars: the spectrum closing in from every
   edge, a tunnel of rings leaping outward on the beat, a slow plasma, laser
   beams sweeping up from the floor, rain of glyphs falling at the pace of
-  their part of the spectrum, stars streaking past. Colours wheel and jump
-  on the beat, the text sways, and covers get a frame of light. When the
+  their part of the spectrum, stars streaking past. The scenes are light,
+  in the colours of the cover playing and its complement, drawn at twice
+  the screen's character resolution; the writing stays readable on a
+  darkened band. Covers get a frame of light, and rows nudge on a strong
+  beat. When the
   music drops back in after a breakdown, the screen flashes once, shakes,
   glitches, and jumps to a hotter scene. `z` again to calm it down.
 
