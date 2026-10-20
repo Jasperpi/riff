@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use futures::StreamExt;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::crossterm::event::{
@@ -43,7 +44,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::crossterm::{cursor, execute};
 use ratatui::style::{Color, Modifier};
 
-use crate::app::App;
+use crate::app::{App, PixelJob};
 use crate::backend::{Backend, Msg};
 use crate::config::Config;
 
@@ -89,6 +90,7 @@ fn main() {
                     &size,
                     value("--keys").as_deref().unwrap_or(""),
                     value("--frames").and_then(|n| n.parse().ok()).unwrap_or(40),
+                    value("--pictures"),
                 ),
                 None => run(value("--cover"), value("--keys")).await,
             },
@@ -305,31 +307,116 @@ fn leave_terminal() {
 
 /// Send this frame's covers that are drawn as real pictures, and take down
 /// any that are no longer wanted. Called once the characters are on screen.
+/// Pixels drawn per pixel the terminal reports, for screens with more
+/// than they admit to; and the most on a side, for the time it takes.
+const DENSITY: f32 = 1.5;
+const LIMIT: f32 = 512.0;
+/// The squares are drawn at the terminal's own size, up to this on a side.
+const SQUARE_LIMIT: f32 = 720.0;
+
+/// The squares drawn this frame, ready to paint finely, from the largest
+/// copy of each cover there is.
+struct Squares<'a> {
+    covers: Vec<Option<std::sync::Arc<image::RgbImage>>>,
+    looks: &'a [(Rect, pop::Look, Option<String>)],
+}
+
+impl<'a> Squares<'a> {
+    fn of(app: &'a App) -> Self {
+        let covers = app
+            .drawn_squares
+            .iter()
+            .map(|(_, _, url)| {
+                let url = url.as_deref()?;
+                art::larger(url).and_then(|l| app.images.get(&l)).or_else(|| app.images.get(url)).cloned()
+            })
+            .collect();
+        Self { covers, looks: &app.drawn_squares }
+    }
+
+    fn painters(&self) -> Vec<(Rect, pop::Painter<'_>)> {
+        self.looks.iter().zip(&self.covers).map(|((rect, look, _), cover)| (*rect, pop::Painter::new(cover.as_deref(), rect.width, rect.height, *look))).collect()
+    }
+
+    /// What a picture of `cells` shows, to tell whether it needs sending again.
+    fn key(&self, cells: Rect, cell: (u16, u16), hub: Option<&pop::Hub>) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (cells.x, cells.y, cells.width, cells.height, cell).hash(&mut h);
+        for ((rect, look, _), cover) in self.looks.iter().zip(&self.covers) {
+            if rect.intersects(cells) {
+                pop::look_key(look).hash(&mut h);
+                cover.as_ref().map(|c| c.width()).hash(&mut h);
+            }
+        }
+        if let Some(hub) = hub {
+            ((hub.beat * 4.0).round() as i32, hub.to, (hub.radius * 4.0) as i32).hash(&mut h);
+        }
+        h.finish()
+    }
+}
+
+/// The picture a job asks for, for a terminal whose characters are `cell`
+/// pixels: its size, its pixels, and whether it goes over the others.
+fn draw_picture(app: &App, painters: &[(Rect, pop::Painter)], cells: Rect, job: &PixelJob, cell: (u16, u16)) -> Option<(u32, u32, Vec<u8>, bool)> {
+    let (wide, tall) = (cells.width as f32 * cell.0 as f32, cells.height as f32 * cell.1 as f32);
+    match job {
+        PixelJob::Depth(url) => {
+            let larger = art::larger(url).and_then(|url| app.images.get(&url));
+            let (depth, image) = (app.depths.get(url)?, larger.or_else(|| app.images.get(url))?);
+            let scale = DENSITY.min(LIMIT / wide.max(tall));
+            let (w, h) = ((wide * scale) as u32, (tall * scale) as u32);
+            Some((w, h, art::render_depth_rgb(image, depth, w, h, app.art_fx()), false))
+        }
+        PixelJob::Square | PixelJob::Hub { .. } => {
+            let hub = hub_of(app, job);
+            let scale = 1.0f32.min(SQUARE_LIMIT / wide.max(tall));
+            let (w, h) = ((wide * scale).max(1.0) as u32, (tall * scale).max(1.0) as u32);
+            Some((w, h, pop::scene(painters, hub.as_ref(), cells, w, h), hub.is_some()))
+        }
+    }
+}
+
+fn hub_of(app: &App, job: &PixelJob) -> Option<pop::Hub> {
+    match *job {
+        PixelJob::Hub { centre, radius, to } => Some(pop::Hub { centre, radius, to, beat: app.beat }),
+        _ => None,
+    }
+}
+
+/// Send this frame's real pictures, and take down any no longer wanted.
+/// Called once the characters are on screen. A picture of the squares that
+/// hasn't changed since it was sent is left as it is.
 fn show_pictures(app: &mut App) {
-    /// Pixels drawn per pixel the terminal reports, for screens with more
-    /// than they admit to; and the most on a side, for the time it takes.
-    const DENSITY: f32 = 1.5;
-    const LIMIT: f32 = 512.0;
     let jobs = std::mem::take(&mut app.pixel_jobs);
     let Some(mut screen) = app.pixels.take() else { return };
-    let fx = app.art_fx();
+    let squares = Squares::of(app);
+    let painters = squares.painters();
+    // A cover sent again is drawn over the disc in the middle; it is then sent again too.
+    let mut covers_sent = false;
     let mut shown = 0;
-    for (cells, url) in &jobs {
-        let larger = art::larger(url).and_then(|url| app.images.get(&url));
-        let (Some(depth), Some(image)) = (app.depths.get(url), larger.or_else(|| app.images.get(url))) else {
-            continue;
+    for (cells, job) in &jobs {
+        let key = match job {
+            PixelJob::Depth(_) => None,
+            _ => Some(squares.key(*cells, screen.cell, hub_of(app, job).as_ref())),
         };
-        let (wide, tall) = (cells.width as f32 * screen.cell.0 as f32, cells.height as f32 * screen.cell.1 as f32);
-        let scale = DENSITY.min(LIMIT / wide.max(tall));
-        let (w, h) = ((wide * scale) as u32, (tall * scale) as u32);
-        let started = Instant::now();
-        let rgb = art::render_depth_rgb(image, depth, w, h, fx);
-        if screen.show(shown, *cells, w, h, &rgb, started.elapsed()).is_err() {
-            break;
+        let hub = matches!(job, PixelJob::Hub { .. });
+        let wanted = key.is_none() || screen.showing(shown) != key || (hub && covers_sent);
+        if wanted {
+            let started = Instant::now();
+            let Some((w, h, rgb, above)) = draw_picture(app, &painters, *cells, job, screen.cell) else { continue };
+            if screen.show(shown, *cells, w, h, &rgb, started.elapsed(), above).is_err() {
+                break;
+            }
+            if let Some(key) = key {
+                screen.mark(shown, key);
+                covers_sent |= !hub;
+            }
         }
         shown += 1;
     }
     screen.keep(shown);
+    drop(painters);
     app.pixels = Some(screen);
 }
 
@@ -1187,13 +1274,20 @@ use crate::model::Playlist;
 
 /// Render one demo frame to stdout as ANSI text: `--demo --snapshot 120x36 --keys "v"`.
 /// Keys are literal characters plus `<enter> <esc> <tab> <up> <down> <left> <right>`.
-fn snapshot(size: &str, keys: &str, frames: u32) -> Result<()> {
+/// Draw the demo after `keys` and `frames` ticks and print it as ANSI text.
+/// With `pictures` (a directory), the terminal is taken to show real
+/// pictures, in characters 9 by 18 pixels, and each is saved there as
+/// `x_y_width_height.png` (in cells), for laying over the text.
+fn snapshot(size: &str, keys: &str, frames: u32, pictures: Option<String>) -> Result<()> {
     let (w, h) = size
         .split_once('x')
         .and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?)))
         .ok_or_else(|| anyhow!("size looks like 120x36"))?;
     let mut app = demo::app(Config::default());
     app.fixed_step = Some(1.0 / 30.0);
+    if pictures.is_some() {
+        app.pixels = Some(pixels::pretend((9, 18)));
+    }
     let mut terminal = Terminal::new(TestBackend::new(w, h))?;
 
     for code in typed_keys(keys)? {
@@ -1206,6 +1300,17 @@ fn snapshot(size: &str, keys: &str, frames: u32) -> Result<()> {
     }
     terminal.draw(|f| ui::draw(f, &mut app))?;
 
+    if let Some(dir) = pictures {
+        std::fs::create_dir_all(&dir)?;
+        let squares = Squares::of(&app);
+        let painters = squares.painters();
+        for (cells, job) in &app.pixel_jobs {
+            if let Some((pw, ph, rgb, above)) = draw_picture(&app, &painters, *cells, job, (9, 18)) {
+                let name = format!("{}/{}_{}_{}_{}{}.png", dir, cells.x, cells.y, cells.width, cells.height, if above { "_above" } else { "" });
+                image::RgbImage::from_raw(pw, ph, rgb).ok_or_else(|| anyhow!("bad picture"))?.save(name)?;
+            }
+        }
+    }
     print!("{}", frame_to_ansi(terminal.backend().buffer()));
     Ok(())
 }

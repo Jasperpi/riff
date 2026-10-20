@@ -33,6 +33,15 @@ pub struct Screen {
     shown: usize,
     /// Running totals for the log: frames, time drawing them, time sending them.
     sent: (u32, Duration, Duration),
+    /// What each slot is known to be showing, so a picture that hasn't
+    /// changed need not be sent again.
+    keys: Vec<Option<u64>>,
+}
+
+/// A terminal that draws pictures, with characters `cell` pixels in size,
+/// that isn't there: for `--snapshot`, which saves the pictures to files.
+pub fn pretend(cell: (u16, u16)) -> Screen {
+    Screen { cell, jpeg: false, shown: 0, sent: (0, Duration::ZERO, Duration::ZERO), keys: Vec::new() }
 }
 
 /// Ask the terminal whether it draws pictures. For raw mode, before anything
@@ -54,7 +63,7 @@ pub fn detect() -> Option<Screen> {
             question.extend(b"\x1b\\");
             ask(&question).windows(9).any(|w| w == b"_Gi=32;OK")
         };
-    let mut screen = Screen { cell: (0, 0), jpeg, shown: 0, sent: (0, Duration::ZERO, Duration::ZERO) };
+    let mut screen = Screen { cell: (0, 0), jpeg, shown: 0, sent: (0, Duration::ZERO, Duration::ZERO), keys: Vec::new() };
     if !screen.measure() {
         return None;
     }
@@ -99,6 +108,8 @@ impl Screen {
     /// Read the size of a character cell again (the window or its font changed).
     /// False if the terminal won't say, in which case pictures can't be placed.
     pub fn measure(&mut self) -> bool {
+        // Pictures are sized in pixels: all of them want sending again.
+        self.keys.clear();
         match ratatui::crossterm::terminal::window_size() {
             Ok(size) if size.width > 0 && size.height > 0 && size.columns > 0 && size.rows > 0 => {
                 self.cell = (size.width / size.columns, size.height / size.rows);
@@ -108,10 +119,23 @@ impl Screen {
         }
     }
 
+    /// What slot `slot` was last marked as showing.
+    pub fn showing(&self, slot: usize) -> Option<u64> {
+        self.keys.get(slot).copied().flatten()
+    }
+
+    /// Note what slot `slot` now shows, for `showing`.
+    pub fn mark(&mut self, slot: usize, key: u64) {
+        if self.keys.len() <= slot {
+            self.keys.resize(slot + 1, None);
+        }
+        self.keys[slot] = Some(key);
+    }
+
     /// Put up picture number `slot`: `rgb` is `w` by `h` pixels, and the
     /// terminal scales it to cover `cells` exactly. One already up in that
-    /// slot is replaced.
-    pub fn show(&mut self, slot: usize, cells: Rect, w: u32, h: u32, rgb: &[u8], drawing: Duration) -> std::io::Result<()> {
+    /// slot is replaced. `above` puts it over any others it overlaps.
+    pub fn show(&mut self, slot: usize, cells: Rect, w: u32, h: u32, rgb: &[u8], drawing: Duration, above: bool) -> std::io::Result<()> {
         use image::ImageEncoder;
         use image::codecs::jpeg::JpegEncoder;
         use image::codecs::png::{CompressionType, FilterType, PngEncoder};
@@ -128,7 +152,10 @@ impl Screen {
                 .map_err(std::io::Error::other)?;
         }
         let mut out = std::io::stdout().lock();
-        out.write_all(&command(slot, cells, &packed))?;
+        if let Some(key) = self.keys.get_mut(slot) {
+            *key = None;
+        }
+        out.write_all(&command(slot, cells, &packed, above))?;
         out.flush()?;
         self.shown = self.shown.max(slot + 1);
 
@@ -158,11 +185,12 @@ impl Screen {
         }
         let _ = out.flush();
         self.shown = keep;
+        self.keys.truncate(keep);
     }
 }
 
 /// What to send the terminal to put a packed picture in `slot`, over `cells`.
-fn command(slot: usize, cells: Rect, packed: &[u8]) -> Vec<u8> {
+fn command(slot: usize, cells: Rect, packed: &[u8], above: bool) -> Vec<u8> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(packed);
     let mut out = Vec::with_capacity(encoded.len() + encoded.len() / 256 + 96);
     let _ = write!(out, "\x1b[{};{}H", cells.y + 1, cells.x + 1);
@@ -175,7 +203,8 @@ fn command(slot: usize, cells: Rect, packed: &[u8]) -> Vec<u8> {
         if std::mem::take(&mut first) {
             // Shown as soon as it arrives (a=T), without moving the cursor
             // (C=1) and without an answer coming back as input (q=2).
-            let _ = write!(out, "\x1b_Ga=T,q=2,C=1,f=100,i={id},p=1,c={},r={},m={more};", cells.width, cells.height);
+            let z = if above { ",z=1" } else { "" };
+            let _ = write!(out, "\x1b_Ga=T,q=2,C=1,f=100,i={id},p=1,c={},r={}{z},m={more};", cells.width, cells.height);
         } else {
             let _ = write!(out, "\x1b_Gm={more};");
         }
@@ -203,7 +232,7 @@ mod tests {
     fn a_picture_goes_out_whole_in_pieces_the_terminal_accepts() {
         // Big enough to need several pieces, and not a multiple of anything.
         let packed: Vec<u8> = (0..20_011u32).map(|i| (i * 31 % 251) as u8).collect();
-        let sent = command(1, Rect { x: 4, y: 2, width: 36, height: 16 }, &packed);
+        let sent = command(1, Rect { x: 4, y: 2, width: 36, height: 16 }, &packed, false);
         let text = String::from_utf8(sent).unwrap();
 
         // The cursor goes to the top-left cell first (counted from one).

@@ -24,9 +24,9 @@ pub struct Config {
     pub dynamic_color: bool,
     pub visualizer: bool,
     pub mouse: bool,
-    /// Draw the depth cover as a real picture in terminals that can show
-    /// one (kitty, Konsole, Ghostty, WezTerm); otherwise, and when this is
-    /// off, it is drawn in half-blocks like the rest.
+    /// Draw the depth cover and the squares' covers as real pictures in
+    /// terminals that can show them (kitty, Konsole, Ghostty, WezTerm);
+    /// otherwise, and when this is off, they are drawn in half-blocks.
     pub pictures: bool,
     /// Blend the end of each song into the start of the next.
     pub mix: bool,
